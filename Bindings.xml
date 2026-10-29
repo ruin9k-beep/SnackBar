@@ -1,0 +1,23 @@
+<Bindings>
+    <Binding name="SNACKBAR_EAT" header="SNACKBAR">
+        SnackBar_Eat()
+    </Binding>
+    <Binding name="SNACKBAR_CUSTOM1">
+        SnackBar_UseCustom(1)
+    </Binding>
+    <Binding name="SNACKBAR_CUSTOM2">
+        SnackBar_UseCustom(2)
+    </Binding>
+    <Binding name="SNACKBAR_CUSTOM3">
+        SnackBar_UseCustom(3)
+    </Binding>
+    <Binding name="SNACKBAR_CUSTOM4">
+        SnackBar_UseCustom(4)
+    </Binding>
+    <Binding name="SNACKBAR_CUSTOM5">
+        SnackBar_UseCustom(5)
+    </Binding>
+    <Binding name="SNACKBAR_CUSTOM6">
+        SnackBar_UseCustom(6)
+    </Binding>
+</Bindings>

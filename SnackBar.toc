@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: SnackBar
+## Notes: One button that eats the best food/drink in your bags. Conjured first, no stat-buff food. /sb for options.
+## Author: ruin9k
+## Version: 1.4
+## SavedVariables: SnackBarDB
+
+SnackBar.lua
