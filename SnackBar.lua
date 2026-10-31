@@ -219,6 +219,39 @@ local function CooldownLeft(bag, slot)
 end
 
 -- One entry per distinct item. byName is keyed by lower-case item name.
+-- Listed items that aren't in your bags still get their icon and tooltip:
+-- whenever an item is seen in your bags we remember its id and icon by name
+-- (SnackBarDB.itemCache), or take them from a shift-clicked link.
+local function CacheItem(name, id, texture)
+    if not (SnackBarDB and name and id) then return end
+    if not SnackBarDB.itemCache then SnackBarDB.itemCache = {} end
+    local key = string.lower(name)
+    local r = SnackBarDB.itemCache[key]
+    if not r then
+        SnackBarDB.itemCache[key] = { id = id, texture = texture }
+    else
+        r.id = id
+        if texture then r.texture = texture end
+    end
+end
+
+-- Placeholder entry (count 0) for a listed item we know but don't carry.
+local function MissingEntry(name)
+    local r = SnackBarDB and SnackBarDB.itemCache and SnackBarDB.itemCache[string.lower(name)]
+    if not r then return nil end
+    local tex = r.texture
+    if not tex and GetItemInfo then
+        local t = { GetItemInfo(r.id) }       -- icon is the last value returned
+        local last = t[table.getn(t)]
+        if type(last) == "string" and string.find(last, "Interface") then
+            tex = last
+            r.texture = last
+        end
+    end
+    return { missing = true, id = r.id, name = name, count = 0,
+             texture = tex or LIST_ICON }
+end
+
 local function BuildInventory()
     anyCooldown = false
     anyGcd = false
@@ -242,6 +275,7 @@ local function BuildInventory()
                               texture = texture, count = count,
                               cd = cdl, gcd = gcdl }
                         byId[id] = e
+                        CacheItem(name, id, texture)
                         table.insert(items, e)
                         if name then byName[string.lower(name)] = e end
                     end
@@ -282,13 +316,11 @@ local function GetDeficits(hypothetical)
     return hdef, mdef
 end
 
--- Buffs on you, by lower-case name (cached until the auras change).
-local buffCache
-local function PlayerBuffs()
-    if buffCache then return buffCache end
+-- Names (lower case) of the buffs or debuffs on you, via the aura tooltips.
+local function AuraNames(filter)
     local set = {}
     for i = 0, 31 do
-        local idx = GetPlayerBuff(i, "HELPFUL")
+        local idx = GetPlayerBuff(i, filter)
         if not idx or idx < 0 then break end
         tip:ClearLines()
         tip:SetOwner(WorldFrame, "ANCHOR_NONE")
@@ -297,8 +329,24 @@ local function PlayerBuffs()
         local t = fs and fs:GetText()
         if t and t ~= "" then set[string.lower(t)] = true end
     end
-    buffCache = set
     return set
+end
+
+-- Both are cached until the auras change.
+local buffCache, debuffCache
+local function PlayerBuffs()
+    if not buffCache then buffCache = AuraNames("HELPFUL") end
+    return buffCache
+end
+
+-- Bandages can't be used while "Recently Bandaged" is on you.
+local function IsBandage(name)
+    return name and string.find(string.lower(name), "bandage") ~= nil
+end
+
+local function RecentlyBandaged()
+    if not debuffCache then debuffCache = AuraNames("HARMFUL") end
+    return debuffCache["recently bandaged"] == true
 end
 
 -- Warriors and rogues have no mana.
@@ -452,9 +500,64 @@ local function ServiceLearn(now)
     end
 end
 
+-- Optional: with the Nampower client mod the buffs an item gives can be read
+-- from the game's own tables, so no first use is needed. Anything unexpected
+-- (missing function, different field layout) just returns nil and the
+-- learning above stays in charge.
+local EFFECT_APPLY_AURA, EFFECT_TRIGGER_SPELL = 6, 64
+local ON_USE = 0
+
+local function Idx(t, i)
+    if type(t) ~= "table" then return nil end
+    if t[0] ~= nil then return t[i - 1] end     -- tolerate 0-based arrays
+    return t[i]
+end
+
+local npCache = {}
+
+local function NampowerBuffs(id)
+    if not id or not GetItemStats or not GetSpellRec then return nil end
+    local ok, result = pcall(function()
+        local stats = GetItemStats(id)
+        if not stats then return nil end
+        local found = {}
+        for s = 1, 5 do
+            local sid = Idx(stats.spellId, s)
+            local trig = Idx(stats.spellTrigger, s)
+            if sid and sid > 0 and trig == ON_USE then
+                local rec = GetSpellRec(sid)
+                for e = 1, 3 do
+                    local eff = Idx(rec and rec.effect, e)
+                    local target = nil
+                    if eff == EFFECT_APPLY_AURA then
+                        target = rec
+                    elseif eff == EFFECT_TRIGGER_SPELL then
+                        target = GetSpellRec(Idx(rec.effectTriggerSpell, e) or 0)
+                    end
+                    local aura = target and Idx(target.effectApplyAuraName, 1)
+                    if target and target.name and (aura == nil or aura > 0) then
+                        local n = string.lower(target.name)
+                        if not RESTORE_BUFFS[n] then table.insert(found, n) end
+                    end
+                end
+            end
+        end
+        return found
+    end)
+    if ok and result and table.getn(result) > 0 then return result end
+    return nil
+end
+
 -- True if you already have every buff this item is known to give.
-local function ItemBuffed(name)
-    local saved = SnackBarDB and SnackBarDB.itemBuffs and SnackBarDB.itemBuffs[string.lower(name)]
+local function ItemBuffed(name, id)
+    local key = string.lower(name)
+    local saved = SnackBarDB and SnackBarDB.itemBuffs and SnackBarDB.itemBuffs[key]
+    -- What the item was seen to give always wins; Nampower's guess is only a
+    -- stand-in until then (kept in memory, never saved).
+    if not saved and id then
+        if npCache[id] == nil then npCache[id] = NampowerBuffs(id) or false end
+        saved = npCache[id] or nil
+    end
     if not saved then return false end
     local have = PlayerBuffs()
     local counted = 0
@@ -503,11 +606,26 @@ local function ScanList(cfg, inv)
         for i = 1, table.getn(fills) do table.insert(cands, fills[i]) end
     end
 
+    -- Combat-only bar, out of combat: only the marked item may be used.
+    if cfg.noOoc and cfg.oocFirst and not InCombat() then
+        local want = string.lower(cfg.oocFirst)
+        local only = {}
+        for i = 1, table.getn(cands) do
+            if cands[i].name and string.lower(cands[i].name) == want then
+                table.insert(only, cands[i])
+            end
+        end
+        cands = only
+    end
+
     local ready, waiting = {}, {}
-    local blocked = 0
+    local blocked, bandaged = 0, 0
+    local noBandages = RecentlyBandaged()
     for i = 1, table.getn(cands) do
         local e = cands[i]
-        if cfg.noRebuff and e.name and ItemBuffed(e.name) then
+        if noBandages and IsBandage(e.name) then
+            bandaged = bandaged + 1    -- "Recently Bandaged": skip bandages
+        elseif cfg.noRebuff and e.name and ItemBuffed(e.name, e.id) then
             blocked = blocked + 1      -- its buff is already on you
         elseif (e.cd or 0) > 0 then
             table.insert(waiting, e)
@@ -515,6 +633,19 @@ local function ScanList(cfg, inv)
             table.insert(ready, e)
         end
     end
+    -- Out of combat, the item marked "first out of combat" jumps the queue
+    -- (if it is ready; otherwise the normal order applies).
+    if cfg.oocFirst and not InCombat() then
+        local want = string.lower(cfg.oocFirst)
+        for i = 2, table.getn(ready) do
+            if ready[i].name and string.lower(ready[i].name) == want then
+                local e = table.remove(ready, i)
+                table.insert(ready, 1, e)
+                break
+            end
+        end
+    end
+
     local ordered = {}
     for i = 1, table.getn(ready) do table.insert(ordered, ready[i]) end
     for i = 1, table.getn(waiting) do table.insert(ordered, waiting[i]) end
@@ -523,28 +654,39 @@ local function ScanList(cfg, inv)
     for i = 2, table.getn(ordered) do
         table.insert(rest, ordered[i])
     end
-    return ordered[1], ordered[1], rest, blocked
+
+    -- Listed items we don't carry: shown greyed out at the back (or on the
+    -- button itself if nothing at all is available). Never usable.
+    local shown = ordered[1]
+    for i = 1, table.getn(cfg.items) do
+        local name = cfg.items[i]
+        if not inv.byName[string.lower(name)] then
+            local m = MissingEntry(name)
+            if m then
+                if not shown then shown = m else table.insert(rest, m) end
+            end
+        end
+    end
+    return ordered[1], shown, rest, blocked, bandaged
 end
 
 ----------------------------------------------------------------------
 -- Visuals shared by every button
 ----------------------------------------------------------------------
 
--- "Food" buttons obey the eating rules: no use in combat, shared eat lock,
--- red grey-out in combat. Custom buttons can opt out (potions, bandages...).
--- Per-bar "never use in combat" / "never use out of combat" switches.
+-- The main button is food: no use in combat, red grey-out in combat.
+-- Every button has its own lock after use. Custom bars can be switched off
+-- in combat or out of combat.
 -- Returns "combat" or "ooc" when this unit is switched off right now.
 local function Restriction(u)
     local c = u.cfg
-    local noC, noO
-    if c then
-        noC, noO = c.noCombat, c.noOoc
-    elseif SnackBarDB then
-        noC, noO = SnackBarDB.autoNoCombat, SnackBarDB.autoNoOoc
-    end
+    if not c then return nil end      -- the main button is food: see UnitState
     if InCombat() then
-        if noC then return "combat" end
-    elseif noO then
+        if c.noCombat then return "combat" end
+    elseif c.noOoc then
+        -- The item marked "first out of combat" overrides a combat-only bar:
+        -- ScanList then offers only that item, so a current item means go.
+        if c.oocFirst and u.current then return nil end
         return "ooc"
     end
     return nil
@@ -555,10 +697,8 @@ local function UnitState(u)
     local r = Restriction(u)
     if r == "combat" then return "combat" end
     if r == "ooc" then return "locked" end
-    if u.food then
-        if InCombat() then return "combat" end
-        if GetTime() < u.lockUntil then return "locked" end
-    end
+    if u.food and InCombat() then return "combat" end
+    if (u.food or u.cfg) and GetTime() < u.lockUntil then return "locked" end
     return "normal"
 end
 
@@ -584,7 +724,9 @@ local function TintFlyout(u, state)
     for i = 1, table.getn(u.flyItems) do
         local b = u.flyItems[i]
         if b:IsShown() then
-            if state == "normal" and b.entry
+            if b.entry and b.entry.missing then
+                PaintIcon(b.icon, "locked")      -- not in your bags
+            elseif state == "normal" and b.entry
                 and ((b.entry.cd or 0) > 0 or (b.entry.gcd or 0) > 0) then
                 PaintIcon(b.icon, "locked")      -- on cooldown or GCD: grey
             else
@@ -720,13 +862,15 @@ local function ApplyVisual(u)
         else
             PaintIcon(u.icon, "locked")  -- nothing to eat at all: grey
         end
+    elseif u.shown.missing then
+        PaintIcon(u.icon, "locked")      -- listed but not in your bags
     elseif u.kind == "auto" and not u.current then
         PaintIcon(u.icon, "dim")         -- already full
     else
         PaintIcon(u.icon, "normal")
     end
 
-    if not (u.food and GetTime() < u.lockUntil) then u.lockText:SetText("") end
+    if not ((u.food or u.cfg) and GetTime() < u.lockUntil) then u.lockText:SetText("") end
 
     -- Item on cooldown (every candidate was): grey it and count down.
     if state == "normal" and u.shown and (u.shown.cd or 0) > 0 then
@@ -757,14 +901,12 @@ local function CanUse(u)
         Say("'" .. label .. "' is set not to be used " .. (r == "combat" and "in combat." or "out of combat."))
         return false
     end
-    if u.food then
-        if InCombat() then
-            Say("You can't eat in combat.")
-            return false
-        end
-        -- Still locked from the last time we ate: ignore quietly.
-        if GetTime() < u.lockUntil then return false end
+    if u.food and InCombat() then
+        Say("You can't eat in combat.")
+        return false
     end
+    -- Still locked from the last use: ignore quietly.
+    if GetTime() < u.lockUntil then return false end
 
     -- UseContainerItem would SELL or bank-move the item with these open.
     if (MerchantFrame and MerchantFrame:IsVisible())
@@ -783,9 +925,7 @@ end
 local function UseEntry(u, entry)
     UseContainerItem(entry.bag, entry.slot)
     if u.cfg then StartLearn(entry.name) end
-    if u.food then
-        u.lockUntil = GetTime() + LockSeconds(u)
-    end
+    u.lockUntil = GetTime() + LockSeconds(u)
 end
 
 local function UnitEat(u)
@@ -802,8 +942,11 @@ local function UnitEat(u)
                 Say("No suitable food or drink in your bags.")
             end
         else
-            if (u.blocked or 0) > 0 then
-                Say("You already have the buff from everything available on '" .. ((u.cfg and u.cfg.name) or "that button") .. "'.")
+            local label = (u.cfg and u.cfg.name) or "that button"
+            if (u.bandaged or 0) > 0 and (u.blocked or 0) == 0 then
+                Say("You are Recently Bandaged, and everything available on '" .. label .. "' is a bandage.")
+            elseif (u.bandaged or 0) + (u.blocked or 0) > 0 then
+                Say("Nothing on '" .. label .. "' can be used right now (Recently Bandaged or buff already on you).")
             else
                 Say("None of the items on that button's list are in your bags.")
             end
@@ -822,6 +965,7 @@ end
 local function EatFlyoutItem(u, entry)
     -- On the global cooldown: ignore the click and leave the flyout open.
     if entry and (entry.gcd or 0) > 0 then return end
+    if entry and entry.missing then return end   -- not in your bags
     u.flyout:Hide()
     if not entry then return end
     if not CanUse(u) then return end
@@ -868,7 +1012,12 @@ local function GetFlyItem(u, i)
     b:SetScript("OnEnter", function()
         if this.entry then
             GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-            GameTooltip:SetBagItem(this.entry.bag, this.entry.slot)
+            if this.entry.missing then
+                GameTooltip:SetHyperlink("item:" .. this.entry.id .. ":0:0:0")
+                GameTooltip:AddLine("Not in your bags", 1, 0.4, 0.4)
+            else
+                GameTooltip:SetBagItem(this.entry.bag, this.entry.slot)
+            end
             GameTooltip:Show()
         end
     end)
@@ -936,9 +1085,9 @@ function Refresh(u, inv)
 
     if u.kind == "auto" then
         u.current, u.shown, u.others = ScanAuto(inv)
-        u.blocked = 0
+        u.blocked, u.bandaged = 0, 0
     else
-        u.current, u.shown, u.others, u.blocked = ScanList(u.cfg, inv)
+        u.current, u.shown, u.others, u.blocked, u.bandaged = ScanList(u.cfg, inv)
     end
 
     ApplyVisual(u)
@@ -1091,6 +1240,9 @@ local function NewUnit(frameName, fallback, defX, defY)
             GameTooltip:SetBagItem(u.current.bag, u.current.slot)
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine("Left or right click to use. Shift+drag to move.", 0.6, 0.6, 0.6)
+        elseif u.shown and u.shown.missing then
+            GameTooltip:SetHyperlink("item:" .. u.shown.id .. ":0:0:0")
+            GameTooltip:AddLine("Not in your bags", 1, 0.4, 0.4)
         elseif u.kind == "list" then
             GameTooltip:SetText((u.cfg and u.cfg.name) or "SnackBar")
             GameTooltip:AddLine("None of the listed items are in your bags.", 1, 1, 1)
@@ -1212,7 +1364,7 @@ local function BindCustomUnits()
         if cfg then
             u.cfg = cfg
             u.active = true
-            u.food = (cfg.food ~= false)
+            u.food = false
             ApplyPosition(u)
         else
             u.cfg = nil
@@ -1540,7 +1692,6 @@ function RefreshCustomWindow(inv)
 
     cw.nameBox:SetText(cfg.name or "")
     cw.cbShown:SetChecked(cfg.shown ~= false and 1 or nil)
-    cw.cbFood:SetChecked(cfg.food ~= false and 1 or nil)
     cw.cbNoCombat:SetChecked(cfg.noCombat and 1 or nil)
     cw.cbNoOoc:SetChecked(cfg.noOoc and 1 or nil)
     cw.cbRebuff:SetChecked(cfg.noRebuff and 1 or nil)
@@ -1555,13 +1706,14 @@ function RefreshCustomWindow(inv)
         local r = cw.itemRows[i]
         local name = cfg.items[i]
         if name then
-            local label = i .. ". " .. Trunc(name, 24)
+            local label = i .. ". " .. Trunc(name, 21)
             local e = inv.byName[string.lower(name)]
             if e then
                 r.text:SetText("|cff55ff55" .. label .. " (" .. e.count .. ")|r")
             else
                 r.text:SetText("|cff888888" .. label .. "|r")
             end
+            r.prio:SetChecked((cfg.oocFirst and string.lower(cfg.oocFirst) == string.lower(name)) and 1 or nil)
             if i == 1 then r.up:Disable() else r.up:Enable() end
             if i == m then r.down:Disable() else r.down:Enable() end
             r:Show()
@@ -1640,7 +1792,7 @@ local function BuildCustomWindow()
         end
         table.insert(buttons, {
             name = "Button " .. (table.getn(buttons) + 1),
-            items = {}, food = true, shown = true,
+            items = {}, shown = true,
         })
         cw.selected = table.getn(buttons)
         ConfigChanged()
@@ -1711,13 +1863,6 @@ local function BuildCustomWindow()
             local cfg = SelectedCfg()
             if cfg then cfg.shown = on end
             ApplyCombatVisibility()
-        end)
-
-    cw.cbFood = MakeCheckBox("SnackBarCustomFood", panel, "Food (eat lock, not in combat)",
-        RX - 4, -98, function(on)
-            local cfg = SelectedCfg()
-            if cfg then cfg.food = on end
-            ConfigChanged()
         end)
 
     cw.cbNoCombat = MakeCheckBox("SnackBarCustomNoCombat", panel, "Don't use in combat",
@@ -1819,9 +1964,34 @@ local function BuildCustomWindow()
         r:SetHeight(20)
         r:SetPoint("TOPLEFT", panel, "TOPLEFT", RX, -340 - (i - 1) * 20)
 
+        -- Check one item to use it first when out of combat (only one at a time).
+        r.prio = CreateFrame("CheckButton", "SnackBarCustomItem" .. i .. "Prio", r, "UICheckButtonTemplate")
+        r.prio:SetWidth(20)
+        r.prio:SetHeight(20)
+        r.prio:SetPoint("LEFT", r, "LEFT", -2, 0)
+        r.prio:SetScript("OnClick", function()
+            local cfg = SelectedCfg()
+            if cfg and cfg.items[idx] then
+                if this:GetChecked() then
+                    cfg.oocFirst = cfg.items[idx]
+                else
+                    cfg.oocFirst = nil
+                end
+                RefreshAll()
+            end
+        end)
+        r.prio:SetScript("OnEnter", function()
+            GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Use first out of combat")
+            GameTooltip:AddLine("This item goes to the top of the list while you are out of combat (only one item can be marked).", 1, 1, 1, 1)
+            GameTooltip:AddLine("On a bar set to \"Don't use out of combat\", this item can still be used out of combat.", 0.7, 0.7, 0.7, 1)
+            GameTooltip:Show()
+        end)
+        r.prio:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
         r.text = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        r.text:SetPoint("LEFT", r, "LEFT", 0, 0)
-        r.text:SetWidth(178)
+        r.text:SetPoint("LEFT", r, "LEFT", 22, 0)
+        r.text:SetWidth(156)
         r.text:SetJustifyH("LEFT")
 
         r.up = MakeSmallButton("SnackBarCustomItem" .. i .. "Up", r, "^", 20, 18)
@@ -1853,7 +2023,10 @@ local function BuildCustomWindow()
         r.del:SetScript("OnClick", function()
             local cfg = SelectedCfg()
             if cfg and cfg.items[idx] then
-                table.remove(cfg.items, idx)
+                local removed = table.remove(cfg.items, idx)
+                if cfg.oocFirst and removed and string.lower(cfg.oocFirst) == string.lower(removed) then
+                    cfg.oocFirst = nil
+                end
                 RefreshAll()
             end
         end)
@@ -1870,14 +2043,21 @@ local function BuildCustomWindow()
     addBox:SetHeight(20)
     addBox:SetPoint("TOPLEFT", panel, "TOPLEFT", RX + 6, -604)
     addBox:SetAutoFocus(false)
-    addBox:SetMaxLetters(64)
+    addBox:SetMaxLetters(120)
 
+    local picked
     local function DoAdd()
         local cfg = SelectedCfg()
         if not cfg then return end
         local text = addBox:GetText() or ""
         local _, _, linkName = string.find(text, "%[(.-)%]")   -- accept [Item Name]
+        local _, _, linkId = string.find(text, "item:(%d+)")   -- or a shift-clicked link
         if linkName then text = linkName end
+        if linkName and linkId then CacheItem(linkName, tonumber(linkId)) end
+        if picked and picked.name == string.lower(Trim(text)) then
+            CacheItem(Trim(text), picked.id)
+        end
+        picked = nil
         text = Trim(text)
         if text == "" then return end
         if table.getn(cfg.items) >= MAX_LIST then
@@ -1894,6 +2074,35 @@ local function BuildCustomWindow()
         table.insert(cfg.items, text)
         addBox:SetText("")
         RefreshAll()
+    end
+
+    -- Shift-click an item in your bags or a link in chat while the box has
+    -- focus: its name goes in the box and its id is remembered.
+    local function PickLink(name, id)
+        if not name then return false end
+        addBox:SetText(name)
+        picked = { name = string.lower(name), id = id }
+        return true
+    end
+    local oldBagClick = ContainerFrameItemButton_OnClick
+    ContainerFrameItemButton_OnClick = function(button, ignoreShift)
+        if button == "LeftButton" and not ignoreShift and IsShiftKeyDown()
+            and addBox:HasFocus() then
+            local link = GetContainerItemLink(this:GetParent():GetID(), this:GetID())
+            local _, _, id = string.find(link or "", "item:(%d+)")
+            local _, _, name = string.find(link or "", "%[(.-)%]")
+            if id and PickLink(name, tonumber(id)) then return end
+        end
+        return oldBagClick(button, ignoreShift)
+    end
+    local oldItemRef = SetItemRef
+    SetItemRef = function(link, text, button)
+        if IsShiftKeyDown() and addBox:HasFocus() then
+            local _, _, id = string.find(link or "", "^item:(%d+)")
+            local _, _, name = string.find(text or "", "%[(.-)%]")
+            if id and PickLink(name, tonumber(id)) then return end
+        end
+        return oldItemRef(link, text, button)
     end
 
     addBox:SetScript("OnEnterPressed", function() DoAdd() end)
@@ -1933,7 +2142,7 @@ local optionsFrame
 local function BuildOptions()
     local f = CreateFrame("Frame", "SnackBarOptionsFrame", UIParent)
     f:SetWidth(330)
-    f:SetHeight(480)
+    f:SetHeight(432)
     f:SetPoint("CENTER", UIParent, "CENTER", 0, 50)
     f:SetFrameStrata("DIALOG")
     f:SetMovable(true)
@@ -1978,19 +2187,8 @@ local function BuildOptions()
         "Hide flyout buttons in combat", 22, -124, BoolOption("hideFlyoutCombat"))
     local cbHideFrame = MakeCheckBox("SnackBarCheckHideFrame", f,
         "Hide food buttons entirely in combat", 22, -148, BoolOption("hideFrameCombat"))
-    local function AutoOption(key)
-        return function(on)
-            if SnackBarDB then SnackBarDB[key] = on and true or nil end
-            RefreshAll()
-        end
-    end
-    local cbAutoNoCombat = MakeCheckBox("SnackBarCheckAutoNoCombat", f,
-        "Main button: don't use in combat", 22, -172, AutoOption("autoNoCombat"))
-    local cbAutoNoOoc = MakeCheckBox("SnackBarCheckAutoNoOoc", f,
-        "Main button: don't use out of combat", 22, -196, AutoOption("autoNoOoc"))
-
     -- Main button's flyout direction ----------------------------------
-    local refreshDirs = MakeDirButtons("SnackBarMainDir", f, 26, -224, 130,
+    local refreshDirs = MakeDirButtons("SnackBarMainDir", f, 26, -176, 130,
         function(key)
             if not SnackBarDB then return nil end
             if key == "arrow" then return SnackBarDB.autoArrow end
@@ -2006,7 +2204,7 @@ local function BuildOptions()
     local EAT_ORDER = { false, "health", "mana" }
     local EAT_NAME = { health = "Health food first", mana = "Mana food first" }
     local eatBtn = MakeSmallButton("SnackBarEatFirst", f, "", 200, 22)
-    eatBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -254)
+    eatBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -206)
     eatBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     local function RefreshEatFirst()
         local p = SnackBarDB and SnackBarDB.eatFirst
@@ -2035,15 +2233,15 @@ local function BuildOptions()
 
     -- Sliders ---------------------------------------------------------
     local _, _, setScale = MakeSlider("SnackBarScaleSlider", f, "Button scale",
-        SCALE_MIN, SCALE_MAX, 0.05, "%.2f", -308,
+        SCALE_MIN, SCALE_MAX, 0.05, "%.2f", -260,
         function(v) ApplyScaleAll(v) end)
 
     local _, _, setLock = MakeSlider("SnackBarLockSlider", f, "Main button: lock after eating (sec)",
-        LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -374,
+        LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -326,
         function(v) if SnackBarDB then SnackBarDB.lock = v end end)
 
     local lockHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    lockHint:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -408)
+    lockHint:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -360)
     lockHint:SetWidth(280)
     lockHint:SetJustifyH("LEFT")
     lockHint:SetText("Food buttons ignore clicks this long after eating (0 = off). Custom buttons have their own setting.")
@@ -2061,8 +2259,6 @@ local function BuildOptions()
         cbShow:SetChecked(db.showFlyout and 1 or nil)
         cbHideFly:SetChecked(db.hideFlyoutCombat and 1 or nil)
         cbHideFrame:SetChecked(db.hideFrameCombat and 1 or nil)
-        cbAutoNoCombat:SetChecked(db.autoNoCombat and 1 or nil)
-        cbAutoNoOoc:SetChecked(db.autoNoOoc and 1 or nil)
         refreshDirs()
         RefreshEatFirst()
         keyBtn.Refresh()
@@ -2124,7 +2320,7 @@ driver:SetScript("OnUpdate", function()
     -- Each bar has its own lock: re-skin it when it starts/ends, count it down.
     for i = 1, n do
         local u = allUnits[i]
-        local l = u.active and u.food and now < u.lockUntil
+        local l = u.active and now < u.lockUntil
         if l ~= u.wasLocked then
             u.wasLocked = l
             ApplyVisual(u)
@@ -2218,11 +2414,13 @@ driver:SetScript("OnEvent", function()
         end
     elseif event == "PLAYER_AURAS_CHANGED" then
         buffCache = nil
+        debuffCache = nil
         dirty = true
     elseif event == "PLAYER_REGEN_DISABLED" then
         combatFlag = true
         ApplyCombatVisibility()
         for i = 1, table.getn(allUnits) do ApplyVisual(allUnits[i]) end
+        dirty = true       -- custom lists reorder in combat (out-of-combat priority)
     elseif event == "PLAYER_REGEN_ENABLED" then
         combatFlag = false
         ApplyCombatVisibility()

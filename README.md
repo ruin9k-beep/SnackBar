@@ -12,6 +12,9 @@ Copy this folder into `Interface/AddOns/` and make sure it is named `SnackBar`.
 - Per-bar "don't use in combat" / "don't use out of combat", and "skip items whose buff is already on me".
 - Food is sorted into buff / mana / health / health+mana; custom bars can auto-fill from a category (mana classes only get mana food if it gives a buff or is conjured health+mana food).
 - Mana classes can choose health or mana food first; the button switches to the other kind while you eat so you can drink at the same time.
+- Per-item "use first out of combat" mark (overrides a combat-only bar); bandages are skipped while you have Recently Bandaged.
+- Listed items you don't carry still show their (greyed) icon and tooltip; shift-click items or chat links into the add box.
+- Optional: with the Nampower client mod, an item's buff is read from game data so the buff check works before first use.
 - Greyed while in combat, locked, on cooldown or dead; respects the global cooldown.
 
 ## Commands
