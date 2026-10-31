@@ -15,6 +15,9 @@ Copy this folder into `Interface/AddOns/` and make sure it is named `SnackBar`.
 - Per-item "use first out of combat" mark (overrides a combat-only bar); bandages are skipped while you have Recently Bandaged.
 - Listed items you don't carry still show their (greyed) icon and tooltip; shift-click items or chat links into the add box.
 - Optional: with the Nampower client mod, an item's buff is read from game data so the buff check works before first use.
+- Clock-style cooldown sweep on the button (item cooldown or lock); equipped on-use trinkets can be listed on custom bars.
+- "Always bandage myself" option; with it on, Recently Bandaged shows as the bandage's cooldown.
+- Per-bar flyout arrow toggle.
 - Greyed while in combat, locked, on cooldown or dead; respects the global cooldown.
 
 ## Commands

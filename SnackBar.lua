@@ -202,14 +202,19 @@ local anyGcd = false        -- some bag item was on the global cooldown
 -- A cooldown of 1.5s or less is the global cooldown: it greys the button for
 -- a moment and blocks clicks, but it does NOT make the button advance to the
 -- next item, because it is over almost immediately.
-local function CooldownLeft(bag, slot)
-    local start, duration = GetContainerItemCooldown(bag, slot)
+local function CooldownLeft(bag, slot, equipSlot)
+    local start, duration
+    if equipSlot then
+        start, duration = GetInventoryItemCooldown("player", equipSlot)
+    else
+        start, duration = GetContainerItemCooldown(bag, slot)
+    end
     if start and duration and start > 0 and duration > 0 then
         local left = start + duration - GetTime()
         if left > 0.05 then
             if duration > 1.5 then
                 anyCooldown = true
-                return left, 0
+                return left, 0, start, duration
             end
             anyGcd = true
             return 0, left
@@ -219,6 +224,19 @@ local function CooldownLeft(bag, slot)
 end
 
 -- One entry per distinct item. byName is keyed by lower-case item name.
+-- True if the item in this equipment slot has a "Use:" effect.
+local function TrinketHasUse(slot)
+    tip:ClearLines()
+    tip:SetOwner(WorldFrame, "ANCHOR_NONE")
+    tip:SetInventoryItem("player", slot)
+    for i = 2, tip:NumLines() do
+        local line = getglobal("SnackBarScanTipTextLeft" .. i)
+        local text = line and line:GetText()
+        if text and string.find(text, "^Use:") then return true end
+    end
+    return false
+end
+
 -- Listed items that aren't in your bags still get their icon and tooltip:
 -- whenever an item is seen in your bags we remember its id and icon by name
 -- (SnackBarDB.itemCache), or take them from a shift-clicked link.
@@ -270,10 +288,10 @@ local function BuildInventory()
                     if e then
                         e.count = e.count + count
                     else
-                        local cdl, gcdl = CooldownLeft(bag, slot)
+                        local cdl, gcdl, cdStart, cdDur = CooldownLeft(bag, slot)
                         e = { bag = bag, slot = slot, id = id, name = name,
                               texture = texture, count = count,
-                              cd = cdl, gcd = gcdl }
+                              cd = cdl, gcd = gcdl, cdStart = cdStart, cdDur = cdDur }
                         byId[id] = e
                         CacheItem(name, id, texture)
                         table.insert(items, e)
@@ -281,6 +299,23 @@ local function BuildInventory()
                     end
                 end
             end
+        end
+    end
+
+    -- Equipped on-use trinkets can be listed on custom buttons too. They are
+    -- found by name only (never part of auto-fill) and used from their slot.
+    for slot = 13, 14 do
+        local link = GetInventoryItemLink("player", slot)
+        local _, _, id = string.find(link or "", "item:(%d+)")
+        local _, _, name = string.find(link or "", "%[(.+)%]")
+        if id and name and TrinketHasUse(slot) then
+            id = tonumber(id)
+            local texture = GetInventoryItemTexture("player", slot)
+            local cdl, gcdl, cdStart, cdDur = CooldownLeft(nil, nil, slot)
+            byName[string.lower(name)] = { equip = slot, id = id, name = name,
+                texture = texture, count = "", cd = cdl, gcd = gcdl,
+                cdStart = cdStart, cdDur = cdDur }
+            CacheItem(name, id, texture)
         end
     end
     return { items = items, byName = byName }
@@ -317,7 +352,7 @@ local function GetDeficits(hypothetical)
 end
 
 -- Names (lower case) of the buffs or debuffs on you, via the aura tooltips.
-local function AuraNames(filter)
+local function AuraNames(filter, ends)
     local set = {}
     for i = 0, 31 do
         local idx = GetPlayerBuff(i, filter)
@@ -327,7 +362,14 @@ local function AuraNames(filter)
         tip:SetPlayerBuff(idx)
         local fs = getglobal("SnackBarScanTipTextLeft1")
         local t = fs and fs:GetText()
-        if t and t ~= "" then set[string.lower(t)] = true end
+        if t and t ~= "" then
+            set[string.lower(t)] = true
+            -- when each aura runs out, if the client can tell us
+            if ends and GetPlayerBuffTimeLeft then
+                local left = GetPlayerBuffTimeLeft(idx)
+                if left and left > 0 then ends[string.lower(t)] = GetTime() + left end
+            end
+        end
     end
     return set
 end
@@ -344,9 +386,26 @@ local function IsBandage(name)
     return name and string.find(string.lower(name), "bandage") ~= nil
 end
 
+local debuffEnds = {}
+local BANDAGE_DEBUFF_SECONDS = 60
+
 local function RecentlyBandaged()
-    if not debuffCache then debuffCache = AuraNames("HARMFUL") end
+    if not debuffCache then
+        debuffEnds = {}
+        debuffCache = AuraNames("HARMFUL", debuffEnds)
+    end
     return debuffCache["recently bandaged"] == true
+end
+
+-- With "Always bandage myself" the debuff acts as the bandages' cooldown.
+-- Returns seconds left, cooldown start and duration (nil if unknown).
+local function BandageCooldown()
+    if not RecentlyBandaged() then return nil end
+    local ends = debuffEnds["recently bandaged"]
+    if not ends then return nil end
+    local left = ends - GetTime()
+    if left <= 0 then return nil end
+    return left, ends - BANDAGE_DEBUFF_SECONDS, BANDAGE_DEBUFF_SECONDS
 end
 
 -- Warriors and rogues have no mana.
@@ -624,7 +683,18 @@ local function ScanList(cfg, inv)
     for i = 1, table.getn(cands) do
         local e = cands[i]
         if noBandages and IsBandage(e.name) then
-            bandaged = bandaged + 1    -- "Recently Bandaged": skip bandages
+            local left, st, du
+            if SnackBarDB and SnackBarDB.bandageSelf then left, st, du = BandageCooldown() end
+            if left then
+                -- shown as a cooldown on the bandage itself
+                local c = {}
+                for k, v in pairs(e) do c[k] = v end
+                if left > (c.cd or 0) then c.cd, c.cdStart, c.cdDur = left, st, du end
+                anyCooldown = true
+                table.insert(waiting, c)
+            else
+                bandaged = bandaged + 1    -- "Recently Bandaged": skip bandages
+            end
         elseif cfg.noRebuff and e.name and ItemBuffed(e.name, e.id) then
             blocked = blocked + 1      -- its buff is already on you
         elseif (e.cd or 0) > 0 then
@@ -801,7 +871,11 @@ end
 -- clicking it can always recheck the bags) and, optionally, not in combat.
 local function UpdateFlyoutButton(u)
     PlaceFlyout(u)
-    local show = u.active and SnackBarDB and SnackBarDB.showFlyout
+    -- The main button follows the options window; each custom bar has its own.
+    local show = u.active and SnackBarDB
+    if show then
+        if u.cfg then show = not u.cfg.noFlyout else show = SnackBarDB.showFlyout end
+    end
     if show and u.food and SnackBarDB.hideFlyoutCombat and InCombat() then
         show = false
     end
@@ -838,6 +912,22 @@ local function KeyLabel(u)
         base = string.gsub(base, "^BUTTON", "M")
     end
     return mods .. base
+end
+
+-- Show the sweep for the shown item's cooldown, or else for the lock.
+local function UpdateSweep(u, state)
+    if not u.sweep then return end
+    local start, dur = 0, 0
+    local now = GetTime()
+    if u.shown and (u.shown.cd or 0) > 0 and u.shown.cdStart then
+        start, dur = u.shown.cdStart, u.shown.cdDur
+    elseif (u.food or u.cfg) and (u.lockDur or 0) > 0.3 and now < u.lockUntil then
+        start, dur = u.lockUntil - u.lockDur, u.lockDur
+    end
+    if u.sweepStart ~= start or u.sweepDur ~= dur then
+        u.sweepStart, u.sweepDur = start, dur
+        CooldownFrame_SetTimer(u.sweep, start, dur, dur > 0 and 1 or 0)
+    end
 end
 
 local function ApplyVisual(u)
@@ -880,6 +970,7 @@ local function ApplyVisual(u)
         PaintIcon(u.icon, "locked")      -- global cooldown: grey, no number
     end
 
+    UpdateSweep(u, state)
     u.keyText:SetText(KeyLabel(u))
     TintFlyout(u, state)
     UpdateFlyoutButton(u)
@@ -923,9 +1014,16 @@ local function LockSeconds(u)
 end
 
 local function UseEntry(u, entry)
-    UseContainerItem(entry.bag, entry.slot)
+    if entry.equip then
+        UseInventoryItem(entry.equip)
+    else
+        -- Bandages go on yourself (not your target) if that option is on.
+        local onSelf = SnackBarDB and SnackBarDB.bandageSelf and IsBandage(entry.name)
+        UseContainerItem(entry.bag, entry.slot, onSelf and 1 or nil)
+    end
     if u.cfg then StartLearn(entry.name) end
-    u.lockUntil = GetTime() + LockSeconds(u)
+    u.lockDur = LockSeconds(u)
+    u.lockUntil = GetTime() + u.lockDur
 end
 
 local function UnitEat(u)
@@ -971,7 +1069,12 @@ local function EatFlyoutItem(u, entry)
     if not CanUse(u) then return end
 
     -- Make sure the item is still where we think it is.
-    local link = GetContainerItemLink(entry.bag, entry.slot)
+    local link
+    if entry.equip then
+        link = GetInventoryItemLink("player", entry.equip)
+    else
+        link = GetContainerItemLink(entry.bag, entry.slot)
+    end
     local _, _, id = string.find(link or "", "item:(%d+)")
     id = id and tonumber(id)
     if id ~= entry.id then
@@ -1016,7 +1119,11 @@ local function GetFlyItem(u, i)
                 GameTooltip:SetHyperlink("item:" .. this.entry.id .. ":0:0:0")
                 GameTooltip:AddLine("Not in your bags", 1, 0.4, 0.4)
             else
-                GameTooltip:SetBagItem(this.entry.bag, this.entry.slot)
+                if this.entry.equip then
+                    GameTooltip:SetInventoryItem("player", this.entry.equip)
+                else
+                    GameTooltip:SetBagItem(this.entry.bag, this.entry.slot)
+                end
             end
             GameTooltip:Show()
         end
@@ -1207,6 +1314,13 @@ local function NewUnit(frameName, fallback, defX, defY)
     u.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
     u.icon:SetTexture(fallback)
 
+    -- Clock-style sweep for item cooldowns and the lock after use.
+    if CooldownFrame_SetTimer then
+        u.sweep = CreateFrame("Model", frameName .. "Sweep", btn, "CooldownFrameTemplate")
+        u.sweep:SetPoint("TOPLEFT", btn, "TOPLEFT", 4, -4)
+        u.sweep:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -4, 4)
+    end
+
     local overlay = CreateFrame("Frame", frameName .. "Overlay", btn)
     overlay:SetAllPoints(btn)
     overlay:SetFrameLevel(btn:GetFrameLevel() + 2)
@@ -1237,7 +1351,11 @@ local function NewUnit(frameName, fallback, defX, defY)
     btn:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
         if u.current then
-            GameTooltip:SetBagItem(u.current.bag, u.current.slot)
+            if u.current.equip then
+                GameTooltip:SetInventoryItem("player", u.current.equip)
+            else
+                GameTooltip:SetBagItem(u.current.bag, u.current.slot)
+            end
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine("Left or right click to use. Shift+drag to move.", 0.6, 0.6, 0.6)
         elseif u.shown and u.shown.missing then
@@ -1692,6 +1810,7 @@ function RefreshCustomWindow(inv)
 
     cw.nameBox:SetText(cfg.name or "")
     cw.cbShown:SetChecked(cfg.shown ~= false and 1 or nil)
+    cw.cbFlyout:SetChecked((not cfg.noFlyout) and 1 or nil)
     cw.cbNoCombat:SetChecked(cfg.noCombat and 1 or nil)
     cw.cbNoOoc:SetChecked(cfg.noOoc and 1 or nil)
     cw.cbRebuff:SetChecked(cfg.noRebuff and 1 or nil)
@@ -1865,21 +1984,28 @@ local function BuildCustomWindow()
             ApplyCombatVisibility()
         end)
 
-    cw.cbNoCombat = MakeCheckBox("SnackBarCustomNoCombat", panel, "Don't use in combat",
+    cw.cbFlyout = MakeCheckBox("SnackBarCustomFlyout", panel, "Show flyout arrow",
+        RX - 4, -98, function(on)
+            local cfg = SelectedCfg()
+            if cfg then cfg.noFlyout = (not on) or nil end
+            RefreshAll()
+        end)
+
+    cw.cbNoCombat = MakeCheckBox("SnackBarCustomNoCombat", panel, "Disable in combat",
         RX - 4, -122, function(on)
             local cfg = SelectedCfg()
             if cfg then cfg.noCombat = on and true or nil end
             RefreshAll()
         end)
 
-    cw.cbNoOoc = MakeCheckBox("SnackBarCustomNoOoc", panel, "Don't use out of combat",
+    cw.cbNoOoc = MakeCheckBox("SnackBarCustomNoOoc", panel, "Disable out of combat",
         RX - 4, -146, function(on)
             local cfg = SelectedCfg()
             if cfg then cfg.noOoc = on and true or nil end
             RefreshAll()
         end)
 
-    cw.cbRebuff = MakeCheckBox("SnackBarCustomRebuff", panel, "Skip items whose buff is already on me",
+    cw.cbRebuff = MakeCheckBox("SnackBarCustomRebuff", panel, "Skip an item while its buff is active",
         RX - 4, -170, function(on)
             local cfg = SelectedCfg()
             if cfg then cfg.noRebuff = on and true or nil end
@@ -1887,10 +2013,10 @@ local function BuildCustomWindow()
         end)
     local rebuffHint = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     rebuffHint:SetPoint("TOPLEFT", panel, "TOPLEFT", RX + 22, -196)
-    rebuffHint:SetText("Learns each item's buff the first time you use it.")
+    rebuffHint:SetText("Each item's buff is learned the first time you use it.")
 
     local _, _, setBarLock = MakeSlider("SnackBarCustomLock", panel,
-        "Lock after eating (sec)", LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -224,
+        "Lock after use (sec)", LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -224,
         function(v)
             local cfg = SelectedCfg()
             if cfg then cfg.lock = v end
@@ -2036,7 +2162,7 @@ local function BuildCustomWindow()
 
     local addLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     addLabel:SetPoint("TOPLEFT", panel, "TOPLEFT", RX, -588)
-    addLabel:SetText("Add item by name:")
+    addLabel:SetText("Add item (type a name, or shift-click):")
 
     local addBox = CreateFrame("EditBox", "SnackBarCustomAdd", panel, "InputBoxTemplate")
     addBox:SetWidth(180)
@@ -2095,6 +2221,18 @@ local function BuildCustomWindow()
         end
         return oldBagClick(button, ignoreShift)
     end
+    if PaperDollItemSlotButton_OnClick then
+        local oldSlotClick = PaperDollItemSlotButton_OnClick
+        PaperDollItemSlotButton_OnClick = function(button, ignoreModifiers)
+            if button == "LeftButton" and IsShiftKeyDown() and addBox:HasFocus() then
+                local link = GetInventoryItemLink("player", this:GetID())
+                local _, _, id = string.find(link or "", "item:(%d+)")
+                local _, _, name = string.find(link or "", "%[(.-)%]")
+                if id and PickLink(name, tonumber(id)) then return end
+            end
+            return oldSlotClick(button, ignoreModifiers)
+        end
+    end
     local oldItemRef = SetItemRef
     SetItemRef = function(link, text, button)
         if IsShiftKeyDown() and addBox:HasFocus() then
@@ -2142,7 +2280,7 @@ local optionsFrame
 local function BuildOptions()
     local f = CreateFrame("Frame", "SnackBarOptionsFrame", UIParent)
     f:SetWidth(330)
-    f:SetHeight(432)
+    f:SetHeight(456)
     f:SetPoint("CENTER", UIParent, "CENTER", 0, 50)
     f:SetFrameStrata("DIALOG")
     f:SetMovable(true)
@@ -2171,7 +2309,7 @@ local function BuildOptions()
 
     local keyHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     keyHint:SetPoint("TOPLEFT", keyLabel, "BOTTOMLEFT", 0, -8)
-    keyHint:SetText("Left-click to set (Esc cancels), right-click to clear.")
+    keyHint:SetText("Click to set (Esc cancels). Right-click to clear.")
 
     -- Visibility checkboxes -------------------------------------------
     local function BoolOption(key)
@@ -2182,13 +2320,17 @@ local function BuildOptions()
     end
 
     local cbShow = MakeCheckBox("SnackBarCheckShowFlyout", f,
-        "Show flyout buttons", 22, -100, BoolOption("showFlyout"))
+        "Show flyout arrow", 22, -100, BoolOption("showFlyout"))
     local cbHideFly = MakeCheckBox("SnackBarCheckHideFlyout", f,
-        "Hide flyout buttons in combat", 22, -124, BoolOption("hideFlyoutCombat"))
+        "Hide flyout arrow in combat", 22, -124, BoolOption("hideFlyoutCombat"))
     local cbHideFrame = MakeCheckBox("SnackBarCheckHideFrame", f,
-        "Hide food buttons entirely in combat", 22, -148, BoolOption("hideFrameCombat"))
+        "Hide main button in combat", 22, -148, BoolOption("hideFrameCombat"))
+    local cbBandage = MakeCheckBox("SnackBarCheckBandageSelf", f,
+        "Always bandage myself", 22, -172, function(on)
+            if SnackBarDB then SnackBarDB.bandageSelf = on and true or nil end
+        end)
     -- Main button's flyout direction ----------------------------------
-    local refreshDirs = MakeDirButtons("SnackBarMainDir", f, 26, -176, 130,
+    local refreshDirs = MakeDirButtons("SnackBarMainDir", f, 26, -200, 130,
         function(key)
             if not SnackBarDB then return nil end
             if key == "arrow" then return SnackBarDB.autoArrow end
@@ -2202,13 +2344,13 @@ local function BuildOptions()
 
     -- Which food a mana class eats first (hidden for warriors and rogues) ----
     local EAT_ORDER = { false, "health", "mana" }
-    local EAT_NAME = { health = "Health food first", mana = "Mana food first" }
+    local EAT_NAME = { health = "health food", mana = "mana food" }
     local eatBtn = MakeSmallButton("SnackBarEatFirst", f, "", 200, 22)
-    eatBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -206)
+    eatBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -230)
     eatBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     local function RefreshEatFirst()
         local p = SnackBarDB and SnackBarDB.eatFirst
-        eatBtn:SetText("Eat: " .. (p and EAT_NAME[p] or "best overall"))
+        eatBtn:SetText("Eat first: " .. (p and EAT_NAME[p] or "best fit"))
     end
     eatBtn:SetScript("OnClick", function()
         if not SnackBarDB then return end
@@ -2233,18 +2375,18 @@ local function BuildOptions()
 
     -- Sliders ---------------------------------------------------------
     local _, _, setScale = MakeSlider("SnackBarScaleSlider", f, "Button scale",
-        SCALE_MIN, SCALE_MAX, 0.05, "%.2f", -260,
+        SCALE_MIN, SCALE_MAX, 0.05, "%.2f", -284,
         function(v) ApplyScaleAll(v) end)
 
-    local _, _, setLock = MakeSlider("SnackBarLockSlider", f, "Main button: lock after eating (sec)",
-        LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -326,
+    local _, _, setLock = MakeSlider("SnackBarLockSlider", f, "Lock after eating (sec)",
+        LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -350,
         function(v) if SnackBarDB then SnackBarDB.lock = v end end)
 
     local lockHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    lockHint:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -360)
+    lockHint:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -384)
     lockHint:SetWidth(280)
     lockHint:SetJustifyH("LEFT")
-    lockHint:SetText("Food buttons ignore clicks this long after eating (0 = off). Custom buttons have their own setting.")
+    lockHint:SetText("The main button ignores clicks this long after you eat, so food is not wasted. 0 = off. Custom buttons have their own lock.")
 
     local customBtn = MakeSmallButton("SnackBarOpenCustom", f, "Custom Buttons...", 170, 24)
     customBtn:SetPoint("BOTTOM", f, "BOTTOM", 0, 20)
@@ -2259,6 +2401,7 @@ local function BuildOptions()
         cbShow:SetChecked(db.showFlyout and 1 or nil)
         cbHideFly:SetChecked(db.hideFlyoutCombat and 1 or nil)
         cbHideFrame:SetChecked(db.hideFrameCombat and 1 or nil)
+        cbBandage:SetChecked(db.bandageSelf and 1 or nil)
         refreshDirs()
         RefreshEatFirst()
         keyBtn.Refresh()
@@ -2375,6 +2518,7 @@ driver:RegisterEvent("PLAYER_REGEN_DISABLED")
 driver:RegisterEvent("PLAYER_REGEN_ENABLED")
 driver:RegisterEvent("BAG_UPDATE")
 driver:RegisterEvent("BAG_UPDATE_COOLDOWN")
+driver:RegisterEvent("UNIT_INVENTORY_CHANGED")      -- trinket swapped
 driver:RegisterEvent("UPDATE_BINDINGS")
 driver:RegisterEvent("UNIT_HEALTH")
 driver:RegisterEvent("UNIT_MANA")
