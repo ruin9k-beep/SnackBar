@@ -94,7 +94,8 @@ local function InCombat()
 end
 
 ----------------------------------------------------------------------
--- Tooltip scanning (used by the auto button to recognise food)
+-- Tooltip scanning (recognises food and sorts it into categories:
+-- "buff", "mana", "health" or "both")
 ----------------------------------------------------------------------
 
 local tip = CreateFrame("GameTooltip", "SnackBarScanTip", nil, "GameTooltipTemplate")
@@ -163,10 +164,17 @@ local function ScanItem(bag, slot)
         end
     end
 
-    if (not seated) or buff
-        or (info.health == 0 and info.mana == 0 and info.hpct == 0 and info.mpct == 0) then
-        return false
-    end
+    if not seated then return false end
+    local hasH = info.health > 0 or info.hpct > 0
+    local hasM = info.mana > 0 or info.mpct > 0
+    if not buff and not hasH and not hasM then return false end
+
+    -- Category: a stat buff wins no matter what the food restores.
+    info.buff = buff
+    if buff then info.cat = "buff"
+    elseif hasH and hasM then info.cat = "both"
+    elseif hasM then info.cat = "mana"
+    else info.cat = "health" end
     return info
 end
 
@@ -250,6 +258,7 @@ end
 
 local function Better(a, b)
     if not b then return true end
+    if (a.pri or 0) ~= (b.pri or 0) then return a.pri > b.pri end
     if a.tier ~= b.tier then return a.tier > b.tier end
     if a.eff ~= b.eff then return a.eff > b.eff end
     return a.raw < b.raw
@@ -273,26 +282,79 @@ local function GetDeficits(hypothetical)
     return hdef, mdef
 end
 
+-- Buffs on you, by lower-case name (cached until the auras change).
+local buffCache
+local function PlayerBuffs()
+    if buffCache then return buffCache end
+    local set = {}
+    for i = 0, 31 do
+        local idx = GetPlayerBuff(i, "HELPFUL")
+        if not idx or idx < 0 then break end
+        tip:ClearLines()
+        tip:SetOwner(WorldFrame, "ANCHOR_NONE")
+        tip:SetPlayerBuff(idx)
+        local fs = getglobal("SnackBarScanTipTextLeft1")
+        local t = fs and fs:GetText()
+        if t and t ~= "" then set[string.lower(t)] = true end
+    end
+    buffCache = set
+    return set
+end
+
+-- Warriors and rogues have no mana.
+local function HasManaClass()
+    local _, class = UnitClass("player")
+    return class ~= "WARRIOR" and class ~= "ROGUE"
+end
+
+-- Manaless classes skip food that restores mana, unless it gives a buff or
+-- is conjured food that restores health as well.
+local function ClassAllows(info)
+    if info.buff or HasManaClass() then return true end
+    if info.mana > 0 or info.mpct > 0 then
+        return info.conjured and (info.health > 0 or info.hpct > 0)
+    end
+    return true
+end
+
+-- Mana classes can choose to eat health food or mana food first. While the
+-- chosen kind is being eaten (you have the Food / Drink buff), the other
+-- kind is offered instead so you can eat and drink at once.
+local function PriorityType()
+    local p = SnackBarDB and SnackBarDB.eatFirst
+    if not p or not HasManaClass() then return nil end
+    local have = PlayerBuffs()
+    local eating = have["food"] or have["eating"]
+    local drinking = have["drink"] or have["drinking"]
+    if p == "health" and eating then return "mana" end
+    if p == "mana" and drinking then return "health" end
+    return p
+end
+
 -- Every valid food in the bags, each with a score.
 local function GatherFood(items, hdef, mdef)
     local plevel = UnitLevel("player")
     local list = {}
+    local want = PriorityType()
 
     for i = 1, table.getn(items) do
         local e = items[i]
         local info = GetInfo(e.bag, e.slot, e.id)
-        if info and info.level <= plevel then
+        if info and info.level <= plevel and ClassAllows(info) then
             -- Percent restores become absolute values using your max.
             local h = info.health + info.hpct / 100 * UnitHealthMax("player")
             local m = info.mana + info.mpct / 100 * UnitManaMax("player")
             if mdef <= 0 then m = 0 end
             local eff = math.min(h, hdef) + math.min(m, mdef)
+            if info.buff then eff = 0 end      -- buff food is never picked automatically
             local isPct = (info.hpct > 0 or info.mpct > 0)
             table.insert(list, {
                 bag = e.bag, slot = e.slot, id = e.id,
-                texture = e.texture, count = e.count, info = info,
+                texture = e.texture, count = e.count, info = info, buff = info.buff,
                 cd = e.cd, gcd = e.gcd,
                 score = {
+                    -- the wanted kind (or restore-both food) comes first
+                    pri = (want and (info.cat == want or info.cat == "both")) and 1 or 0,
                     -- conjured beats everything; % food beats flat food
                     tier = (info.conjured and 2 or 0) + (isPct and 1 or 0),
                     eff = eff,
@@ -341,7 +403,10 @@ local function ScanAuto(inv)
     for i = 1, table.getn(list) do
         if list[i] ~= best then table.insert(others, list[i]) end
     end
-    table.sort(others, function(a, b) return Better(a.score, b.score) end)
+    table.sort(others, function(a, b)
+        if a.buff ~= b.buff then return not a.buff end    -- buff food goes last
+        return Better(a.score, b.score)
+    end)
 
     local cur = nil
     if not hypothetical then cur = best end
@@ -349,25 +414,6 @@ local function ScanAuto(inv)
 end
 
 -- Custom buttons: the listed items that are in your bags, in list order.
--- Buffs on you, by lower-case name (cached until the auras change).
-local buffCache
-local function PlayerBuffs()
-    if buffCache then return buffCache end
-    local set = {}
-    for i = 0, 31 do
-        local idx = GetPlayerBuff(i, "HELPFUL")
-        if not idx or idx < 0 then break end
-        tip:ClearLines()
-        tip:SetOwner(WorldFrame, "ANCHOR_NONE")
-        tip:SetPlayerBuff(idx)
-        local fs = getglobal("SnackBarScanTipTextLeft1")
-        local t = fs and fs:GetText()
-        if t and t ~= "" then set[string.lower(t)] = true end
-    end
-    buffCache = set
-    return set
-end
-
 -- Which buff does an item give? The first time a custom button uses it we
 -- note your buffs, then see which new ones show up and save them in
 -- SnackBarDB.itemBuffs[item name].
@@ -425,18 +471,48 @@ end
 -- the back, so the button always advances to the next usable item in the list.
 -- If every listed item is on cooldown, the first one stays on the button.
 local function ScanList(cfg, inv)
+    -- Candidates: the listed items, then (if auto-fill is on) foods of that
+    -- category from your bags, biggest restore first.
+    local cands, seen = {}, {}
+    for i = 1, table.getn(cfg.items) do
+        local name = cfg.items[i]
+        local e = inv.byName[string.lower(name)]
+        if e then
+            table.insert(cands, e)
+            seen[e.id] = true
+        end
+    end
+    if cfg.fill then
+        local plevel = UnitLevel("player")
+        local fills = {}
+        for i = 1, table.getn(inv.items) do
+            local e = inv.items[i]
+            if not seen[e.id] then
+                local info = GetInfo(e.bag, e.slot, e.id)
+                if info and info.cat == cfg.fill and info.level <= plevel and ClassAllows(info) then
+                    e.fillRaw = info.health + info.hpct / 100 * UnitHealthMax("player")
+                              + info.mana + info.mpct / 100 * UnitManaMax("player")
+                    table.insert(fills, e)
+                end
+            end
+        end
+        table.sort(fills, function(a, b)
+            if a.fillRaw ~= b.fillRaw then return a.fillRaw > b.fillRaw end
+            return (a.name or "") < (b.name or "")
+        end)
+        for i = 1, table.getn(fills) do table.insert(cands, fills[i]) end
+    end
+
     local ready, waiting = {}, {}
     local blocked = 0
-    for i = 1, table.getn(cfg.items) do
-        local e = inv.byName[string.lower(cfg.items[i])]
-        if e and cfg.noRebuff and ItemBuffed(cfg.items[i]) then
+    for i = 1, table.getn(cands) do
+        local e = cands[i]
+        if cfg.noRebuff and e.name and ItemBuffed(e.name) then
             blocked = blocked + 1      -- its buff is already on you
-        elseif e then
-            if (e.cd or 0) > 0 then
-                table.insert(waiting, e)
-            else
-                table.insert(ready, e)
-            end
+        elseif (e.cd or 0) > 0 then
+            table.insert(waiting, e)
+        else
+            table.insert(ready, e)
         end
     end
     local ordered = {}
@@ -1468,6 +1544,7 @@ function RefreshCustomWindow(inv)
     cw.cbNoCombat:SetChecked(cfg.noCombat and 1 or nil)
     cw.cbNoOoc:SetChecked(cfg.noOoc and 1 or nil)
     cw.cbRebuff:SetChecked(cfg.noRebuff and 1 or nil)
+    cw.refreshFill()
     cw.setLock(cfg.lock or (SnackBarDB and SnackBarDB.lock) or DEFAULT_LOCK)
     cw.refreshDirs()
     if cw.keyBtn then cw.keyBtn.Refresh() end
@@ -1700,6 +1777,41 @@ local function BuildCustomWindow()
     itemsLabel:SetPoint("TOPLEFT", panel, "TOPLEFT", RX, -322)
     itemsLabel:SetText("Items (top is used first):")
 
+    -- Auto-fill: add foods of one kind from your bags after the listed items.
+    local FILLS = { false, "buff", "mana", "health", "both" }
+    local FILL_NAME = { buff = "Buff food", mana = "Mana food", health = "Health food", both = "Health+mana food" }
+    local fillBtn = MakeSmallButton("SnackBarCustomFill", panel, "", 112, 20)
+    fillBtn:SetPoint("TOPLEFT", panel, "TOPLEFT", RX + 150, -318)
+    fillBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    local function RefreshFill()
+        local cfg = SelectedCfg()
+        local f = cfg and cfg.fill
+        fillBtn:SetText("Fill: " .. (f and FILL_NAME[f] or "Off"))
+    end
+    fillBtn:SetScript("OnClick", function()
+        local cfg = SelectedCfg()
+        if not cfg then return end
+        local idx = 1
+        for i = 1, 5 do if (FILLS[i] or nil) == cfg.fill then idx = i end end
+        idx = idx + ((arg1 == "RightButton") and -1 or 1)
+        if idx > 5 then idx = 1 end
+        if idx < 1 then idx = 5 end
+        cfg.fill = FILLS[idx] or nil
+        RefreshFill()
+        RefreshAll()
+    end)
+    fillBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Auto-fill")
+        GameTooltip:AddLine("Adds food of this kind from your bags after the items listed here.", 1, 1, 1, 1)
+        GameTooltip:AddLine("Buff: gives a stat buff. Mana / Health / Health+mana: restores only that.", 0.7, 0.7, 0.7, 1)
+        GameTooltip:AddLine("Classes without mana skip mana food, except buff food and conjured health+mana food.", 0.7, 0.7, 0.7, 1)
+        GameTooltip:AddLine("Left-click: next kind. Right-click: previous.", 0.7, 0.7, 0.7, 1)
+        GameTooltip:Show()
+    end)
+    fillBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    cw.refreshFill = RefreshFill
+
     for i = 1, MAX_LIST do
         local idx = i
         local r = CreateFrame("Frame", "SnackBarCustomItem" .. i, panel)
@@ -1821,7 +1933,7 @@ local optionsFrame
 local function BuildOptions()
     local f = CreateFrame("Frame", "SnackBarOptionsFrame", UIParent)
     f:SetWidth(330)
-    f:SetHeight(446)
+    f:SetHeight(480)
     f:SetPoint("CENTER", UIParent, "CENTER", 0, 50)
     f:SetFrameStrata("DIALOG")
     f:SetMovable(true)
@@ -1890,17 +2002,48 @@ local function BuildOptions()
             end
         end)
 
+    -- Which food a mana class eats first (hidden for warriors and rogues) ----
+    local EAT_ORDER = { false, "health", "mana" }
+    local EAT_NAME = { health = "Health food first", mana = "Mana food first" }
+    local eatBtn = MakeSmallButton("SnackBarEatFirst", f, "", 200, 22)
+    eatBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -254)
+    eatBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    local function RefreshEatFirst()
+        local p = SnackBarDB and SnackBarDB.eatFirst
+        eatBtn:SetText("Eat: " .. (p and EAT_NAME[p] or "best overall"))
+    end
+    eatBtn:SetScript("OnClick", function()
+        if not SnackBarDB then return end
+        local idx = 1
+        for i = 1, 3 do if (EAT_ORDER[i] or nil) == SnackBarDB.eatFirst then idx = i end end
+        idx = idx + ((arg1 == "RightButton") and -1 or 1)
+        if idx > 3 then idx = 1 end
+        if idx < 1 then idx = 3 end
+        SnackBarDB.eatFirst = EAT_ORDER[idx] or nil
+        RefreshEatFirst()
+        RefreshAll()
+    end)
+    eatBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Eat first")
+        GameTooltip:AddLine("Choose whether the main button offers health food or mana food first.", 1, 1, 1, 1)
+        GameTooltip:AddLine("While you are eating that kind, the button switches to the other kind so you can eat and drink at the same time.", 0.7, 0.7, 0.7, 1)
+        GameTooltip:Show()
+    end)
+    eatBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    if not HasManaClass() then eatBtn:Hide() end
+
     -- Sliders ---------------------------------------------------------
     local _, _, setScale = MakeSlider("SnackBarScaleSlider", f, "Button scale",
-        SCALE_MIN, SCALE_MAX, 0.05, "%.2f", -278,
+        SCALE_MIN, SCALE_MAX, 0.05, "%.2f", -308,
         function(v) ApplyScaleAll(v) end)
 
     local _, _, setLock = MakeSlider("SnackBarLockSlider", f, "Main button: lock after eating (sec)",
-        LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -344,
+        LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -374,
         function(v) if SnackBarDB then SnackBarDB.lock = v end end)
 
     local lockHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    lockHint:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -378)
+    lockHint:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -408)
     lockHint:SetWidth(280)
     lockHint:SetJustifyH("LEFT")
     lockHint:SetText("Food buttons ignore clicks this long after eating (0 = off). Custom buttons have their own setting.")
@@ -1921,6 +2064,7 @@ local function BuildOptions()
         cbAutoNoCombat:SetChecked(db.autoNoCombat and 1 or nil)
         cbAutoNoOoc:SetChecked(db.autoNoOoc and 1 or nil)
         refreshDirs()
+        RefreshEatFirst()
         keyBtn.Refresh()
     end)
 
