@@ -1205,7 +1205,7 @@ end
 
 -- Hook custom slots up to the saved configs.
 local function BindCustomUnits()
-    local list = (SnackBarDB and SnackBarDB.buttons) or {}
+    local list = (SnackBarCharDB and SnackBarCharDB.buttons) or {}
     for i = 1, MAX_CUSTOM do
         local u = customUnits[i]
         local cfg = list[i]
@@ -1500,7 +1500,7 @@ end
 local cw = { selected = 1, rows = {}, itemRows = {} }
 
 local function Buttons()
-    return (SnackBarDB and SnackBarDB.buttons) or {}
+    return (SnackBarCharDB and SnackBarCharDB.buttons) or {}
 end
 
 local function SelectedCfg()
@@ -2195,7 +2195,13 @@ driver:SetScript("OnEvent", function()
         if SnackBarDB.showFlyout == nil then SnackBarDB.showFlyout = true end
         if SnackBarDB.hideFlyoutCombat == nil then SnackBarDB.hideFlyoutCombat = false end
         if SnackBarDB.hideFrameCombat == nil then SnackBarDB.hideFrameCombat = false end
-        if not SnackBarDB.buttons then SnackBarDB.buttons = {} end
+        -- Custom bars are saved per character. Bars saved by older versions
+        -- were account-wide: the first character to log in takes them over.
+        if not SnackBarCharDB then SnackBarCharDB = {} end
+        if not SnackBarCharDB.buttons then
+            SnackBarCharDB.buttons = SnackBarDB.buttons or {}
+            SnackBarDB.buttons = nil
+        end
         for i = 1, table.getn(allUnits) do
             allUnits[i].btn:SetScale(SnackBarDB.scale)
         end
@@ -2256,9 +2262,10 @@ SlashCmdList["SNACKBAR"] = function(msg)
         if SnackBarDB then
             SnackBarDB.x = nil
             SnackBarDB.y = nil
-            for i = 1, table.getn(SnackBarDB.buttons or {}) do
-                SnackBarDB.buttons[i].x = nil
-                SnackBarDB.buttons[i].y = nil
+            local bars = (SnackBarCharDB and SnackBarCharDB.buttons) or {}
+            for i = 1, table.getn(bars) do
+                bars[i].x = nil
+                bars[i].y = nil
             end
         end
         for i = 1, table.getn(allUnits) do ApplyPosition(allUnits[i]) end

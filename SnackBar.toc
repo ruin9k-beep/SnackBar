@@ -4,5 +4,6 @@
 ## Author: ruin9k
 ## Version: 1.4
 ## SavedVariables: SnackBarDB
+## SavedVariablesPerCharacter: SnackBarCharDB
 
 SnackBar.lua
