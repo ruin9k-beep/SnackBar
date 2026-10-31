@@ -1317,6 +1317,7 @@ local function NewUnit(frameName, fallback, defX, defY)
     -- Clock-style sweep for item cooldowns and the lock after use.
     if CooldownFrame_SetTimer then
         u.sweep = CreateFrame("Model", frameName .. "Sweep", btn, "CooldownFrameTemplate")
+        u.sweep.noCooldownCount = true      -- we draw our own number; stops OmniCC-style addons adding a second one
         u.sweep:SetPoint("TOPLEFT", btn, "TOPLEFT", 4, -4)
         u.sweep:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -4, 4)
     end
