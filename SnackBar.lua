@@ -13,6 +13,11 @@
 --   a list of item names in the order you want them used. The button uses the
 --   first listed item that is in your bags; the rest go in its flyout.
 --
+-- ITEM BARS: three more automatic buttons for health items (potions, bandages,
+--   healthstones), mana items (potions, gems, runes) and items that
+--   restore both. They pick by how much you are missing, and by combat status.
+--   Food never appears on them. Set them up in /sb on their own tabs.
+--
 -- Left or right click = use.  Shift+drag = move.
 -- Hover the little arrow above a button for its flyout.
 -- /sb            open options
@@ -20,6 +25,7 @@
 -- /sb eat        eat the currently prioritized food
 -- /sb rescan     recheck your bags
 -- /sb reset      reset all button positions
+-- /sb minimap    show or hide the minimap icon
 
 local PREFIX = "|cffffcc00SnackBar:|r "
 
@@ -41,6 +47,9 @@ local FLY_PAD = 5
 
 BINDING_HEADER_SNACKBAR = "SnackBar"
 BINDING_NAME_SNACKBAR_EAT = "Eat best food/drink"
+BINDING_NAME_SNACKBAR_HEALTH = "Use best health item"
+BINDING_NAME_SNACKBAR_MANA = "Use best mana item"
+BINDING_NAME_SNACKBAR_BOTH = "Use best health + mana item"
 for i = 1, MAX_CUSTOM do
     setglobal("BINDING_NAME_SNACKBAR_CUSTOM" .. i, "Use custom button " .. i)
 end
@@ -79,6 +88,9 @@ local customFrame             -- custom button editor window
 local RefreshCustomWindow     -- assigned below
 local Refresh                 -- assigned below
 local RefreshKeyLabels        -- assigned below
+local PlaceMinimapButton      -- assigned below
+local UpdateMinimapButton     -- assigned below
+local itemUnits = {}          -- the health / mana / both item bars
 
 local function Trim(s)
     return (string.gsub(s, "^%s*(.-)%s*$", "%1"))
@@ -197,6 +209,7 @@ end
 
 local anyCooldown = false   -- some bag item had a real cooldown at the last scan
 local anyGcd = false        -- some bag item was on the global cooldown
+local seenNames = {}        -- lowercase names of the items in your bags
 
 -- Returns (cooldownLeft, gcdLeft) in seconds for the item in a bag slot.
 -- A cooldown of 1.5s or less is the global cooldown: it greys the button for
@@ -295,7 +308,10 @@ local function BuildInventory()
                         byId[id] = e
                         CacheItem(name, id, texture)
                         table.insert(items, e)
-                        if name then byName[string.lower(name)] = e end
+                        if name then
+                            byName[string.lower(name)] = e
+                            seenNames[string.lower(name)] = true
+                        end
                     end
                 end
             end
@@ -629,6 +645,351 @@ local function ItemBuffed(name, id)
     return counted > 0
 end
 
+----------------------------------------------------------------------
+-- Health / mana / health+mana item bars. These are the potions, bandages,
+-- healthstones, mana gems and runes that are used on the spot.
+-- Food never appears here: it needs you to sit down, and the auto button
+-- looks after it.
+----------------------------------------------------------------------
+
+-- missOoc / missCombat: how much health or mana must be missing before the bar
+-- offers an item. minGain: the least an item must actually restore.
+-- maxWaste: the most it may overheal (5000 = no limit). minHealth: items that
+-- cost health are skipped if they would leave you below this much.
+local ITEM_BAR_DEFAULTS = {
+    health = { name = "Health items", shown = true, missOoc = 300, missCombat = 150,
+               minGain = 100, maxWaste = 5000, potionsOoc = false, bandageCombat = false },
+    mana = { name = "Mana items", shown = true, missOoc = 300, missCombat = 150,
+             minGain = 100, maxWaste = 5000, potionsOoc = false, minHealth = 800 },
+    both = { name = "Health + mana items", shown = true, missOoc = 300, missCombat = 150,
+             minGain = 100, maxWaste = 5000, potionsOoc = false },
+}
+
+-- First amount in some text: "900 to 1,500" or "250" or "5%".
+-- Returns average, maximum and the text after it.
+local function ReadAmount(t)
+    local _, e, a, b = string.find(t, "^%s*([%d,%.]+) to ([%d,%.]+)")
+    if a then
+        a, b = Num(a), Num(b)
+        return (a + b) / 2, b, string.sub(t, e + 1)
+    end
+    local _, e2, c = string.find(t, "^%s*([%d,%.]+)")
+    if c then
+        c = Num(c)
+        return c, c, string.sub(t, e2 + 1)
+    end
+    return nil
+end
+
+-- The sentence that follows a word like "restores", and the text after it.
+local function Clause(use, word)
+    local _, e = string.find(use, word .. " ")
+    if not e then return nil end
+    local rest = string.sub(use, e + 1)
+    local stop = string.find(rest, "%.%s") or string.find(rest, "%.$")
+    if stop then return string.sub(rest, 1, stop - 1), string.sub(rest, stop + 1) end
+    return rest, ""
+end
+
+-- Which of health / mana is mentioned first.
+local function StatWord(t)
+    local ph = string.find(t, "health") or string.find(t, "life") or string.find(t, "damage")
+    local pm = string.find(t, "mana")
+    if ph and pm then return (ph < pm) and "health" or "mana" end
+    if ph then return "health" end
+    if pm then return "mana" end
+    return nil
+end
+
+local function ParseRestore(clause, info, heals)
+    local avg, _, rest = ReadAmount(clause)
+    if not avg then return end
+    local pct = string.find(rest, "^%s*%%") ~= nil
+
+    local function Put(stat, v, isPct)
+        if stat == "health" then
+            if isPct then info.hpct = v else info.h = v end
+        elseif stat == "mana" then
+            if isPct then info.mpct = v else info.m = v end
+        end
+    end
+
+    if string.find(rest, "health and mana") or string.find(rest, "mana and health")
+        or string.find(rest, "life and mana") or string.find(rest, "mana and life") then
+        Put("health", avg, pct)
+        Put("mana", avg, pct)
+        return
+    end
+
+    local stat = heals and "health" or StatWord(rest)
+    if not stat then return end
+    Put(stat, avg, pct)
+
+    -- "restores 100 health and 50 mana"
+    local _, _, tail = string.find(rest, " and (.*)")
+    if tail then
+        local a2, _, r2 = ReadAmount(tail)
+        if a2 then
+            local s2 = StatWord(r2)
+            if s2 and s2 ~= stat then Put(s2, a2, string.find(r2, "^%s*%%") ~= nil) end
+        end
+    end
+end
+
+-- Health an item takes from you: "Drains 600 to 1000 life". Returns average, maximum.
+local function SelfCost(t)
+    local words = { "drain", "costs", "lose", "sacrifice" }
+    for i = 1, table.getn(words) do
+        local _, e = string.find(t, words[i])
+        if e then
+            local tail = string.sub(t, e + 1)
+            local d = string.find(tail, "%d")
+            if d and d <= 20 then
+                local avg, mx, rest = ReadAmount(string.sub(tail, d))
+                if avg and (string.find(rest, "health") or string.find(rest, "life")) then
+                    return avg, mx
+                end
+            end
+        end
+    end
+    return 0, 0
+end
+
+-- What items really restore, from your own combat log. Keyed by lowercase
+-- item name; a running average of the last 20 uses, saved between sessions.
+local lastUsed, lastUsedAt = nil, 0
+
+local function LogKey(name)
+    local l = string.lower(name)
+    if seenNames[l] then return l end
+    if lastUsed and GetTime() - lastUsedAt < 8 then
+        local n = string.len(l)
+        if string.sub(lastUsed, -n) == l then return lastUsed end
+    end
+    return nil
+end
+
+local function RecordRestore(stat, amount, name)
+    amount = tonumber(amount)
+    if not amount or not name or not SnackBarDB then return end
+    name = string.gsub(name, "^[Yy]our ", "")
+    if IsBandage(name) then return end        -- bandages heal in small ticks
+    local key = LogKey(name)
+    if not key then return end
+    if not SnackBarDB.itemLog then SnackBarDB.itemLog = {} end
+    local r = SnackBarDB.itemLog[key]
+    if not r then
+        r = {}
+        SnackBarDB.itemLog[key] = r
+    end
+    local nk = stat .. "n"
+    local n = math.min((r[nk] or 0) + 1, 20)
+    r[nk] = n
+    r[stat] = (r[stat] or amount) + (amount - (r[stat] or amount)) / n
+end
+
+local function ReadRestoreMessage(msg)
+    if not msg or string.find(msg, "critical") then return end
+    local _, _, name, amt = string.find(msg, "^Your (.+) heals you for (%d+)")
+    if name then RecordRestore("h", amt, name) return end
+    local _, _, amt2, name2 = string.find(msg, "^You gain (%d+) [Hh]ealth from (.+)%.$")
+    if name2 then RecordRestore("h", amt2, name2) return end
+    local _, _, amt3, name3 = string.find(msg, "^You gain (%d+) [Mm]ana from (.+)%.$")
+    if name3 then RecordRestore("m", amt3, name3) end
+end
+
+-- Reads an item's tooltip. Returns nil if the tooltip isn't ready yet, false
+-- if the item is not a health/mana consumable (food included), or a table:
+-- { cat = "health" | "mana" | "both", h, m (flat amounts), hpct, mpct,
+--   dmg, dmgMax (health it costs you), conjured, bandage, level }
+local function ScanConsumable(bag, slot)
+    tip:ClearLines()
+    tip:SetOwner(WorldFrame, "ANCHOR_NONE")
+    tip:SetBagItem(bag, slot)
+
+    local nameLine = getglobal("SnackBarScanTipTextLeft1")
+    local itemName = nameLine and nameLine:GetText()
+    if not itemName or itemName == "" then return nil end
+
+    local info = { h = 0, m = 0, hpct = 0, mpct = 0, dmg = 0, dmgMax = 0,
+                   level = 0, conjured = false }
+    local use = ""
+    for i = 1, tip:NumLines() do
+        local fs = getglobal("SnackBarScanTipTextLeft" .. i)
+        local text = fs and fs:GetText()
+        if text then
+            local l = string.lower(text)
+            if i == 1 and string.find(l, "^conjured") then info.conjured = true end
+            if l == "conjured item" then info.conjured = true end
+            local _, _, lvl = string.find(l, "requires level (%d+)")
+            if lvl then info.level = tonumber(lvl) end
+            if string.find(l, "^use:") then use = use .. " " .. l end
+        end
+    end
+    if use == "" then return false end
+
+    -- Food and drink make you sit: never on these bars.
+    if string.find(use, "remain seated") or string.find(use, "while eating")
+        or string.find(use, "while drinking") then
+        return false
+    end
+    -- Timed stat bonuses and regeneration buffs are not instant restores.
+    if string.find(use, "you will gain") or string.find(use, "increases")
+        or string.find(use, "for %d+ min") or string.find(use, "for %d+ hour")
+        or string.find(use, "per %d+ sec") then
+        return false
+    end
+
+    local heals = false
+    local clause = Clause(use, "restores")
+    if not clause then
+        clause = Clause(use, "heals")
+        heals = clause ~= nil
+    end
+    if not clause then return false end
+    ParseRestore(clause, info, heals)
+    info.dmg, info.dmgMax = SelfCost(use)
+
+    local hasH = info.h > 0 or info.hpct > 0
+    local hasM = info.m > 0 or info.mpct > 0
+    if not hasH and not hasM then return false end
+
+    info.bandage = IsBandage(itemName) and true or false
+    if hasH and hasM then info.cat = "both"
+    elseif hasM then info.cat = "mana"
+    else info.cat = "health" end
+    return info
+end
+
+local function GetConsumableInfo(bag, slot, itemId)
+    local key = "c" .. itemId
+    local c = cache[key]
+    if c == nil then
+        c = ScanConsumable(bag, slot)
+        if c == nil then
+            scanIncomplete = true
+        else
+            cache[key] = c
+        end
+    end
+    return c
+end
+
+-- a is a better pick than b: more useful wins; when about equal, the cheaper
+-- kind of item wins; then the smaller one, so big items aren't wasted.
+local function Fits(a, b)
+    local tol = 0.1 * math.max(a.useful, b.useful)
+    if math.abs(a.useful - b.useful) > tol then return a.useful > b.useful end
+    if a.tier ~= b.tier then return a.tier < b.tier end
+    return a.total < b.total
+end
+
+-- Item bar scan: returns current (what a click uses now, or nil), shown (what
+-- the icon displays) and others (everything else, for the flyout).
+local function ScanItemBar(u, inv)
+    local cfg, kind = u.cfg, u.kind
+    local hp, hmax = UnitHealth("player"), UnitHealthMax("player")
+    local mp, mmax = 0, 0
+    if UnitPowerType("player") == 0 then
+        mp, mmax = UnitMana("player"), UnitManaMax("player")
+    end
+    local missH, missM = hmax - hp, mmax - mp
+    local combat = InCombat()
+    local missing = math.max(missH, 0) + math.max(missM, 0)
+    if kind == "health" then missing = math.max(missH, 0)
+    elseif kind == "mana" then missing = math.max(missM, 0) end
+    local minMissing = (combat and cfg.missCombat or cfg.missOoc) or 0
+    local minGain = cfg.minGain or 0
+    local maxWaste = cfg.maxWaste or 5000
+    if maxWaste >= 5000 then maxWaste = nil end
+    local minHp = cfg.minHealth or 0
+    local noBandages = RecentlyBandaged()
+    local plevel = UnitLevel("player")
+    local list = {}
+
+    -- Work out how much of this candidate would be useful, and whether the
+    -- bar's rules allow it right now.
+    local function Judge(c)
+        local ah = c.ah
+        local am = c.am
+        c.total = ah + am
+        c.useful = math.min(ah, math.max(missH, 0)) + math.min(am, math.max(missM, 0))
+        local ok = c.useful > 0 and missing >= minMissing and c.useful >= minGain
+        if maxWaste and c.total - c.useful > maxWaste then ok = false end
+        local paid = (c.tier == 2 or c.tier == 3)       -- potions and runes
+        if paid and not combat and not cfg.potionsOoc then ok = false end
+        if c.bandage and combat and not cfg.bandageCombat then ok = false end
+        if c.dmg > 0 and hp - c.dmg < minHp then ok = false end
+        c.ok = ok
+    end
+
+    for i = 1, table.getn(inv.items) do
+        local e = inv.items[i]
+        local info = GetConsumableInfo(e.bag, e.slot, e.id)
+        if info and info.cat == kind and info.level <= plevel then
+            local c = {}
+            for k, v in pairs(e) do c[k] = v end
+            c.info = info
+            c.ah = info.h + info.hpct / 100 * hmax
+            c.am = info.m + info.mpct / 100 * mmax
+            -- What it really restored in your combat log beats the tooltip.
+            local seen = SnackBarDB and SnackBarDB.itemLog and e.name
+                and SnackBarDB.itemLog[string.lower(e.name)]
+            if seen then
+                if seen.h and c.ah > 0 and info.hpct == 0 then c.ah = seen.h; c.seen = true end
+                if seen.m and c.am > 0 and info.mpct == 0 then c.am = seen.m; c.seen = true end
+            end
+            c.dmg = info.dmgMax
+            c.bandage = info.bandage
+            if info.conjured then c.tier = 0
+            elseif c.dmg > 0 then c.tier = 3
+            elseif c.bandage then c.tier = 1
+            else c.tier = 2 end
+
+            local skip = false
+            if c.bandage and noBandages then
+                -- Recently Bandaged: skipped, or shown as the bandage's cooldown
+                local left, st, du
+                if SnackBarDB and SnackBarDB.bandageSelf then left, st, du = BandageCooldown() end
+                if left then
+                    if left > (c.cd or 0) then c.cd, c.cdStart, c.cdDur = left, st, du end
+                    anyCooldown = true
+                else
+                    skip = true
+                end
+            end
+            if not skip then
+                Judge(c)
+                table.insert(list, c)
+            end
+        end
+    end
+
+    local best, bestWaiting
+    for i = 1, table.getn(list) do
+        local c = list[i]
+        if c.ok then
+            if (c.cd or 0) > 0 then
+                if not bestWaiting or Fits(c, bestWaiting) then bestWaiting = c end
+            elseif not best or Fits(c, best) then
+                best = c
+            end
+        end
+    end
+    best = best or bestWaiting
+
+    local others = {}
+    for i = 1, table.getn(list) do
+        if list[i] ~= best then table.insert(others, list[i]) end
+    end
+    table.sort(others, function(a, b)
+        if a.tier ~= b.tier then return a.tier < b.tier end
+        return a.total > b.total
+    end)
+
+    return best, best or others[1], others
+end
+
 -- Items that aren't in your bags are skipped, and items on cooldown move to
 -- the back, so the button always advances to the next usable item in the list.
 -- If every listed item is on cooldown, the first one stays on the button.
@@ -954,8 +1315,8 @@ local function ApplyVisual(u)
         end
     elseif u.shown.missing then
         PaintIcon(u.icon, "locked")      -- listed but not in your bags
-    elseif u.kind == "auto" and not u.current then
-        PaintIcon(u.icon, "dim")         -- already full
+    elseif u.kind ~= "list" and not u.current then
+        PaintIcon(u.icon, "dim")         -- already full / nothing worth using
     else
         PaintIcon(u.icon, "normal")
     end
@@ -989,7 +1350,7 @@ local function CanUse(u)
     local r = Restriction(u)
     if r then
         local label = (u.cfg and u.cfg.name) or "Auto button"
-        Say("'" .. label .. "' is set not to be used " .. (r == "combat" and "in combat." or "out of combat."))
+        Say("'" .. label .. "' is disabled " .. (r == "combat" and "in combat." or "out of combat."))
         return false
     end
     if u.food and InCombat() then
@@ -1021,7 +1382,10 @@ local function UseEntry(u, entry)
         local onSelf = SnackBarDB and SnackBarDB.bandageSelf and IsBandage(entry.name)
         UseContainerItem(entry.bag, entry.slot, onSelf and 1 or nil)
     end
-    if u.cfg then StartLearn(entry.name) end
+    if entry.name then
+        lastUsed, lastUsedAt = string.lower(entry.name), GetTime()
+    end
+    if u.kind == "list" then StartLearn(entry.name) end
     u.lockDur = LockSeconds(u)
     u.lockUntil = GetTime() + u.lockDur
 end
@@ -1039,14 +1403,16 @@ local function UnitEat(u)
             else
                 Say("No suitable food or drink in your bags.")
             end
+        elseif u.kind ~= "list" then
+            Say("'" .. u.cfg.name .. "': nothing worth using right now (none in your bags, or it wouldn't help enough).")
         else
             local label = (u.cfg and u.cfg.name) or "that button"
             if (u.bandaged or 0) > 0 and (u.blocked or 0) == 0 then
-                Say("You are Recently Bandaged, and everything available on '" .. label .. "' is a bandage.")
+                Say("You're Recently Bandaged, and '" .. label .. "' only has bandages.")
             elseif (u.bandaged or 0) + (u.blocked or 0) > 0 then
-                Say("Nothing on '" .. label .. "' can be used right now (Recently Bandaged or buff already on you).")
+                Say("'" .. label .. "' has nothing usable right now (Recently Bandaged, or the buff is already active).")
             else
-                Say("None of the items on that button's list are in your bags.")
+                Say("None of that button's items are in your bags.")
             end
         end
         return
@@ -1089,6 +1455,26 @@ end
 -- Flyout contents
 ----------------------------------------------------------------------
 
+-- Tooltip for a bag item, equipped trinket or an item we don't carry.
+local function ShowEntryTip(e)
+    if e.missing then
+        GameTooltip:SetHyperlink("item:" .. e.id .. ":0:0:0")
+        GameTooltip:AddLine("Not in your bags", 1, 0.4, 0.4)
+    elseif e.equip then
+        GameTooltip:SetInventoryItem("player", e.equip)
+    else
+        GameTooltip:SetBagItem(e.bag, e.slot)
+    end
+    local seen = SnackBarDB and SnackBarDB.itemLog and e.name
+        and SnackBarDB.itemLog[string.lower(e.name)]
+    if seen and (seen.h or seen.m) then
+        local t = "Your log:"
+        if seen.h then t = t .. string.format(" %d health", seen.h + 0.5) end
+        if seen.m then t = t .. string.format(" %d mana", seen.m + 0.5) end
+        GameTooltip:AddLine(t .. " on average", 0.6, 0.8, 1)
+    end
+end
+
 local function GetFlyItem(u, i)
     local b = u.flyItems[i]
     if b then return b end
@@ -1115,16 +1501,7 @@ local function GetFlyItem(u, i)
     b:SetScript("OnEnter", function()
         if this.entry then
             GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-            if this.entry.missing then
-                GameTooltip:SetHyperlink("item:" .. this.entry.id .. ":0:0:0")
-                GameTooltip:AddLine("Not in your bags", 1, 0.4, 0.4)
-            else
-                if this.entry.equip then
-                    GameTooltip:SetInventoryItem("player", this.entry.equip)
-                else
-                    GameTooltip:SetBagItem(this.entry.bag, this.entry.slot)
-                end
-            end
+            ShowEntryTip(this.entry)
             GameTooltip:Show()
         end
     end)
@@ -1193,8 +1570,11 @@ function Refresh(u, inv)
     if u.kind == "auto" then
         u.current, u.shown, u.others = ScanAuto(inv)
         u.blocked, u.bandaged = 0, 0
-    else
+    elseif u.kind == "list" then
         u.current, u.shown, u.others, u.blocked, u.bandaged = ScanList(u.cfg, inv)
+    else
+        u.current, u.shown, u.others = ScanItemBar(u, inv)
+        u.blocked, u.bandaged = 0, 0
     end
 
     ApplyVisual(u)
@@ -1276,6 +1656,34 @@ local function ApplyPosition(u)
     end
 end
 
+-- Failsafe for buttons dragged off screen: forget every saved position and
+-- put the main button in the middle of the screen, custom bars in a row below.
+local function ResetPositions()
+    if SnackBarDB then
+        SnackBarDB.x = nil
+        SnackBarDB.y = nil
+    end
+    local bars = (SnackBarCharDB and SnackBarCharDB.buttons) or {}
+    for i = 1, table.getn(bars) do
+        bars[i].x = nil
+        bars[i].y = nil
+    end
+    for i = 1, table.getn(itemUnits) do
+        local c = itemUnits[i].cfg
+        if c then
+            c.x = nil
+            c.y = nil
+        end
+    end
+    if SnackBarDB then
+        SnackBarDB.mmX = nil
+        SnackBarDB.mmY = nil
+    end
+    if PlaceMinimapButton then PlaceMinimapButton() end
+    for i = 1, table.getn(allUnits) do ApplyPosition(allUnits[i]) end
+    Say("Button positions reset to the center of the screen.")
+end
+
 local function ApplyScaleAll(v)
     for i = 1, table.getn(allUnits) do SavePosition(allUnits[i]) end   -- old scale
     for i = 1, table.getn(allUnits) do allUnits[i].btn:SetScale(v) end
@@ -1352,16 +1760,18 @@ local function NewUnit(frameName, fallback, defX, defY)
     btn:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
         if u.current then
-            if u.current.equip then
-                GameTooltip:SetInventoryItem("player", u.current.equip)
-            else
-                GameTooltip:SetBagItem(u.current.bag, u.current.slot)
-            end
+            ShowEntryTip(u.current)
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine("Left or right click to use. Shift+drag to move.", 0.6, 0.6, 0.6)
-        elseif u.shown and u.shown.missing then
-            GameTooltip:SetHyperlink("item:" .. u.shown.id .. ":0:0:0")
-            GameTooltip:AddLine("Not in your bags", 1, 0.4, 0.4)
+        elseif u.shown then
+            ShowEntryTip(u.shown)
+            if u.kind ~= "list" and not u.shown.missing then
+                GameTooltip:AddLine("Not needed right now.", 1, 0.8, 0.4)
+            end
+        elseif u.kind ~= "list" and u.kind ~= "auto" then
+            GameTooltip:SetText((u.cfg and u.cfg.name) or "SnackBar")
+            GameTooltip:AddLine("Nothing to use right now.", 1, 1, 1)
+            GameTooltip:AddLine("Shift+drag to move. /sb for options.", 0.6, 0.6, 0.6)
         elseif u.kind == "list" then
             GameTooltip:SetText((u.cfg and u.cfg.name) or "SnackBar")
             GameTooltip:AddLine("None of the listed items are in your bags.", 1, 1, 1)
@@ -1425,7 +1835,7 @@ local function NewUnit(frameName, fallback, defX, defY)
 end
 
 -- The auto button, plus a pool of slots for custom buttons.
-mainUnit = NewUnit("SnackBarButton", FOOD_ICON, 0, -150)
+mainUnit = NewUnit("SnackBarButton", FOOD_ICON, 0, 0)
 mainUnit.active = true
 mainUnit.action = "SNACKBAR_EAT"
 table.insert(allUnits, mainUnit)
@@ -1434,11 +1844,28 @@ for i = 1, MAX_CUSTOM do
     -- Default spots: a row well below the options/editor windows (which cover
     -- the area around screen center), so new buttons and their flyout arrows
     -- are never hidden behind them. Shift+drag to move.
-    local u = NewUnit("SnackBarCustom" .. i, LIST_ICON, -140 + 56 * (i - 1), -230)
+    local u = NewUnit("SnackBarCustom" .. i, LIST_ICON, -140 + 56 * (i - 1), -60)
     u.kind = "list"
     u.action = "SNACKBAR_CUSTOM" .. i
     u.btn:Hide()
     customUnits[i] = u
+    table.insert(allUnits, u)
+end
+
+-- The three item bars: a row above the main button.
+local ITEM_BARS = {
+    { key = "health", action = "SNACKBAR_HEALTH", icon = "Interface\\Icons\\INV_Potion_54" },
+    { key = "mana", action = "SNACKBAR_MANA", icon = "Interface\\Icons\\INV_Potion_73" },
+    { key = "both", action = "SNACKBAR_BOTH", icon = "Interface\\Icons\\INV_Potion_47" },
+}
+for i = 1, table.getn(ITEM_BARS) do
+    local d = ITEM_BARS[i]
+    local u = NewUnit("SnackBarItem" .. i, d.icon, -56 + 56 * (i - 1), 60)
+    u.kind = d.key
+    u.food = false
+    u.action = d.action
+    u.btn:Hide()
+    itemUnits[i] = u
     table.insert(allUnits, u)
 end
 
@@ -1461,6 +1888,7 @@ local function ApplyCombatVisibility()
         local u = allUnits[i]
         local want = u.active
         if want and u.cfg and u.cfg.shown == false then want = false end
+        if want and u == mainUnit and SnackBarDB and SnackBarDB.hideMain then want = false end
         if want and u.food and SnackBarDB and SnackBarDB.hideFrameCombat and InCombat() then
             want = false
         end
@@ -1495,7 +1923,26 @@ local function BindCustomUnits()
     dirty = true
 end
 
+-- Hook the item bars up to their saved settings. The mana bars are only used
+-- by classes that have mana.
+local function BindItemBars()
+    if not (SnackBarDB and SnackBarDB.itemBars) then return end
+    for i = 1, table.getn(itemUnits) do
+        local u = itemUnits[i]
+        u.cfg = SnackBarDB.itemBars[u.kind]
+        u.active = (u.kind == "health") or HasManaClass()
+        ApplyPosition(u)
+    end
+    ApplyCombatVisibility()
+    dirty = true
+end
+
 -- Keybind entry points (see Bindings.xml)
+function SnackBar_UseItemBar(i)
+    local u = itemUnits[i]
+    if u and u.active then UnitEat(u) end
+end
+
 function SnackBar_Eat()
     UnitEat(mainUnit)
 end
@@ -1651,6 +2098,17 @@ local function MakeKeyCapture(name, parent, getAction)
 
     local capturing = false
 
+    -- Keys are caught by a transparent full-screen frame (like the game's own
+    -- Key Bindings window), which also stops clicks reaching the UI meanwhile.
+    local cap = CreateFrame("Frame", name .. "Capture", UIParent)
+    cap:SetAllPoints(UIParent)
+    cap:SetFrameStrata("FULLSCREEN_DIALOG")
+    cap:EnableMouse(true)
+    cap:Hide()
+    local capText = cap:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    capText:SetPoint("CENTER", UIParent, "CENTER", 0, 120)
+    capText:SetText("Press a key, key combination or mouse button to bind it. Esc cancels.")
+
     function b.Refresh()
         RefreshKeyLabels()
         if capturing then
@@ -1670,7 +2128,8 @@ local function MakeKeyCapture(name, parent, getAction)
 
     function b.Stop()
         capturing = false
-        b:EnableKeyboard(false)
+        cap:EnableKeyboard(false)
+        cap:Hide()
         b.Refresh()
     end
 
@@ -1689,32 +2148,28 @@ local function MakeKeyCapture(name, parent, getAction)
             b.Refresh()
         else
             capturing = true
-            b:EnableKeyboard(true)
+            cap:Show()
+            cap:EnableKeyboard(true)
             b.Refresh()
         end
     end)
 
-    b:SetScript("OnKeyDown", function()
-        if not capturing then return end
-        local key = arg1
-        if key == "ESCAPE" then
-            b.Stop()
-            return
-        end
-        if key == "SHIFT" or key == "CTRL" or key == "ALT"
-            or key == "LSHIFT" or key == "RSHIFT"
-            or key == "LCTRL" or key == "RCTRL"
-            or key == "LALT" or key == "RALT" then
-            return   -- wait for the real key
-        end
+    -- Modifier presses seen while capturing (cleared when released).
+    local held = {}
+    local lone      -- name of a modifier pressed and not yet released alone
+
+    -- Bind a key or mouse button, with whatever modifiers are held.
+    local function Commit(key)
         local action = getAction()
         if not action then
             b.Stop()
             return
         end
-        if IsShiftKeyDown() then key = "SHIFT-" .. key end
-        if IsControlKeyDown() then key = "CTRL-" .. key end
-        if IsAltKeyDown() then key = "ALT-" .. key end
+        -- The game's own order is ALT-CTRL-SHIFT-KEY.
+        -- Ask the game, and also trust the modifier presses we saw ourselves.
+        if IsShiftKeyDown() or held.shift then key = "SHIFT-" .. key end
+        if IsControlKeyDown() or held.ctrl then key = "CTRL-" .. key end
+        if IsAltKeyDown() or held.alt then key = "ALT-" .. key end
 
         local old = GetBindingAction(key)
         if old and old ~= "" and old ~= action then
@@ -1724,15 +2179,82 @@ local function MakeKeyCapture(name, parent, getAction)
         local k1, k2 = GetBindingKey(action)
         if k1 then SetBinding(k1) end
         if k2 then SetBinding(k2) end
-        SetBinding(key, action)
+        local ok = SetBinding(key, action)
         SaveBindings(GetCurrentBindingSet())
+        held.shift, held.ctrl, held.alt = nil, nil, nil
+        Say(ok and ("Bound " .. key .. ".") or ("Couldn't bind " .. key .. ": the game refused it."))
         b.Stop()
+    end
+
+    -- Mouse: middle button, side buttons and the wheel bind. A plain left or
+    -- right click cancels (so you can back out); with a modifier held it binds.
+    local MOUSE_NAME = { MiddleButton = "BUTTON3", Button4 = "BUTTON4", Button5 = "BUTTON5",
+                         LeftButton = "BUTTON1", RightButton = "BUTTON2" }
+    cap:EnableMouseWheel(true)
+    cap:SetScript("OnMouseDown", function()
+        if not capturing then return end
+        local key = MOUSE_NAME[arg1]
+        local modded = IsShiftKeyDown() or IsControlKeyDown() or IsAltKeyDown()
+            or held.shift or held.ctrl or held.alt
+        if not key or ((arg1 == "LeftButton" or arg1 == "RightButton") and not modded) then
+            b.Stop()
+            return
+        end
+        lone = nil
+        Commit(key)
+    end)
+    cap:SetScript("OnMouseWheel", function()
+        if not capturing then return end
+        lone = nil
+        Commit(arg1 > 0 and "MOUSEWHEELUP" or "MOUSEWHEELDOWN")
+    end)
+
+    -- A modifier pressed and released on its own is bound as that key.
+    cap:SetScript("OnKeyUp", function()
+        if not capturing then return end
+        local name = arg1 or ""
+        local bare = string.gsub(name, "^[LR]", "")
+        local isMod = true
+        if bare == "SHIFT" then held.shift = nil
+        elseif bare == "CTRL" or bare == "CONTROL" then held.ctrl = nil
+        elseif bare == "ALT" or bare == "MENU" then held.alt = nil
+        else isMod = false end
+        if isMod and lone == name then
+            lone = nil
+            local action = getAction()
+            if not action then b.Stop() return end
+            local k1, k2 = GetBindingKey(action)
+            if k1 then SetBinding(k1) end
+            if k2 then SetBinding(k2) end
+            local ok = SetBinding(name, action)
+            SaveBindings(GetCurrentBindingSet())
+            Say(ok and ("Bound " .. name .. ".") or ("Couldn't bind " .. name .. ": the game refused it."))
+            held.shift, held.ctrl, held.alt = nil, nil, nil
+            b.Stop()
+        end
+    end)
+
+    cap:SetScript("OnKeyDown", function()
+        if not capturing then return end
+        local key = arg1
+        if key == "ESCAPE" then
+            b.Stop()
+            return
+        end
+        -- Modifier keys on their own: wait for the real key. Clients name
+        -- them differently (CTRL, LCTRL, CONTROL, LMENU for Alt...).
+        local bare = string.gsub(key, "^[LR]", "")
+        if bare == "SHIFT" then held.shift = true; lone = key; return end
+        if bare == "CTRL" or bare == "CONTROL" then held.ctrl = true; lone = key; return end
+        if bare == "ALT" or bare == "MENU" then held.alt = true; lone = key; return end
+        lone = nil
+        Commit(key)
     end)
 
     b:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
         GameTooltip:SetText("Keybind")
-        GameTooltip:AddLine("Left-click, then press a key.", 1, 1, 1)
+        GameTooltip:AddLine("Left-click, then press a key or mouse button.", 1, 1, 1)
         GameTooltip:AddLine("Esc cancels. Right-click clears.", 0.7, 0.7, 0.7)
         GameTooltip:Show()
     end)
@@ -1916,7 +2438,7 @@ local function BuildCustomWindow()
         })
         cw.selected = table.getn(buttons)
         ConfigChanged()
-        Say("Created '" .. buttons[cw.selected].name .. "'. Look for the \"?\" button below the options window; Shift+drag to move it.")
+        Say("Created '" .. buttons[cw.selected].name .. "'. Its button (a \"?\" icon) is on your screen: Shift+drag to move it.")
     end)
 
     local delBtn = MakeSmallButton("SnackBarCustomDelete", f, "Delete", 64, 22)
@@ -1939,7 +2461,7 @@ local function BuildCustomWindow()
 
     cw.emptyHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     cw.emptyHint:SetPoint("TOPLEFT", f, "TOPLEFT", RX + 6, -90)
-    cw.emptyHint:SetText("Click New to make a custom button.")
+    cw.emptyHint:SetText("Click New to create a custom button.")
 
     -- Right column: everything for the selected button ----------------
     local panel = CreateFrame("Frame", "SnackBarCustomPanel", f)
@@ -2076,7 +2598,7 @@ local function BuildCustomWindow()
         GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
         GameTooltip:SetText("Auto-fill")
         GameTooltip:AddLine("Adds food of this kind from your bags after the items listed here.", 1, 1, 1, 1)
-        GameTooltip:AddLine("Buff: gives a stat buff. Mana / Health / Health+mana: restores only that.", 0.7, 0.7, 0.7, 1)
+        GameTooltip:AddLine("Buff food gives a stat buff. Mana, Health and Health+mana food restore only that.", 0.7, 0.7, 0.7, 1)
         GameTooltip:AddLine("Classes without mana skip mana food, except buff food and conjured health+mana food.", 0.7, 0.7, 0.7, 1)
         GameTooltip:AddLine("Left-click: next kind. Right-click: previous.", 0.7, 0.7, 0.7, 1)
         GameTooltip:Show()
@@ -2110,8 +2632,8 @@ local function BuildCustomWindow()
         r.prio:SetScript("OnEnter", function()
             GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
             GameTooltip:SetText("Use first out of combat")
-            GameTooltip:AddLine("This item goes to the top of the list while you are out of combat (only one item can be marked).", 1, 1, 1, 1)
-            GameTooltip:AddLine("On a bar set to \"Don't use out of combat\", this item can still be used out of combat.", 0.7, 0.7, 0.7, 1)
+            GameTooltip:AddLine("Moves this item to the top of the list while you're out of combat. Only one item can be marked.", 1, 1, 1, 1)
+            GameTooltip:AddLine("On a bar set to \"Disable out of combat\", this item can still be used out of combat.", 0.7, 0.7, 0.7, 1)
             GameTooltip:Show()
         end)
         r.prio:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2163,7 +2685,7 @@ local function BuildCustomWindow()
 
     local addLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     addLabel:SetPoint("TOPLEFT", panel, "TOPLEFT", RX, -588)
-    addLabel:SetText("Add item (type a name, or shift-click):")
+    addLabel:SetText("Add an item (type its name or shift-click it):")
 
     local addBox = CreateFrame("EditBox", "SnackBarCustomAdd", panel, "InputBoxTemplate")
     addBox:SetWidth(180)
@@ -2188,7 +2710,7 @@ local function BuildCustomWindow()
         text = Trim(text)
         if text == "" then return end
         if table.getn(cfg.items) >= MAX_LIST then
-            Say("A list holds at most " .. MAX_LIST .. " items.")
+            Say("A list can hold at most " .. MAX_LIST .. " items.")
             return
         end
         local lower = string.lower(text)
@@ -2281,7 +2803,7 @@ local optionsFrame
 local function BuildOptions()
     local f = CreateFrame("Frame", "SnackBarOptionsFrame", UIParent)
     f:SetWidth(330)
-    f:SetHeight(456)
+    f:SetHeight(640)
     f:SetPoint("CENTER", UIParent, "CENTER", 0, 50)
     f:SetFrameStrata("DIALOG")
     f:SetMovable(true)
@@ -2298,17 +2820,55 @@ local function BuildOptions()
     local close = CreateFrame("Button", "SnackBarOptionsClose", f, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6, -6)
 
+    -- Tabs: General (the main food button) and one for each item bar -----
+    local pages = {}          -- tab key -> page frame
+    local tabButtons = {}
+    local pageStoppers = {}   -- cancel half-finished keybind captures
+
+    local function NewPage(top)
+        local pg = CreateFrame("Frame", nil, f)
+        pg:SetPoint("TOPLEFT", f, "TOPLEFT", 0, top)
+        pg:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 0, 0)
+        return pg
+    end
+
+    local function SelectTab(key)
+        for k, pg in pairs(pages) do
+            if k == key then pg:Show() else pg:Hide() end
+        end
+        for k, b in pairs(tabButtons) do
+            if k == key then b:Disable() else b:Enable() end
+        end
+    end
+
+    local TAB_LIST = {
+        { key = "general", label = "General" },
+        { key = "health", label = "Health" },
+        { key = "mana", label = "Mana" },
+        { key = "both", label = "Both" },
+    }
+    for i = 1, table.getn(TAB_LIST) do
+        local t = TAB_LIST[i]
+        local b = MakeSmallButton("SnackBarTab" .. t.key, f, t.label, 66, 22)
+        b:SetPoint("TOPLEFT", f, "TOPLEFT", 22 + (i - 1) * 70, -40)
+        b:SetScript("OnClick", function() SelectTab(t.key) end)
+        tabButtons[t.key] = b
+    end
+
+    local g = NewPage(-16)    -- General page
+    pages.general = g
+
     -- Keybind ---------------------------------------------------------
-    local keyLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    keyLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -56)
+    local keyLabel = g:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    keyLabel:SetPoint("TOPLEFT", g, "TOPLEFT", 26, -56)
     keyLabel:SetText("Keybind:")
 
-    local keyBtn = MakeKeyCapture("SnackBarKeyButton", f, function()
+    local keyBtn = MakeKeyCapture("SnackBarKeyButton", g, function()
         return "SNACKBAR_EAT"
     end)
     keyBtn:SetPoint("LEFT", keyLabel, "RIGHT", 12, 0)
 
-    local keyHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    local keyHint = g:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     keyHint:SetPoint("TOPLEFT", keyLabel, "BOTTOMLEFT", 0, -8)
     keyHint:SetText("Click to set (Esc cancels). Right-click to clear.")
 
@@ -2320,18 +2880,28 @@ local function BuildOptions()
         end
     end
 
-    local cbShow = MakeCheckBox("SnackBarCheckShowFlyout", f,
-        "Show flyout arrow", 22, -100, BoolOption("showFlyout"))
-    local cbHideFly = MakeCheckBox("SnackBarCheckHideFlyout", f,
-        "Hide flyout arrow in combat", 22, -124, BoolOption("hideFlyoutCombat"))
-    local cbHideFrame = MakeCheckBox("SnackBarCheckHideFrame", f,
-        "Hide main button in combat", 22, -148, BoolOption("hideFrameCombat"))
-    local cbBandage = MakeCheckBox("SnackBarCheckBandageSelf", f,
-        "Always bandage myself", 22, -172, function(on)
+    local cbMain = MakeCheckBox("SnackBarCheckShowMain", g,
+        "Show main button", 22, -100, function(on)
+            if SnackBarDB then SnackBarDB.hideMain = (not on) or nil end
+            ApplyCombatVisibility()
+        end)
+    local cbShow = MakeCheckBox("SnackBarCheckShowFlyout", g,
+        "Show flyout arrow", 22, -124, BoolOption("showFlyout"))
+    local cbHideFly = MakeCheckBox("SnackBarCheckHideFlyout", g,
+        "Hide flyout arrow in combat", 22, -148, BoolOption("hideFlyoutCombat"))
+    local cbHideFrame = MakeCheckBox("SnackBarCheckHideFrame", g,
+        "Hide main button in combat", 22, -172, BoolOption("hideFrameCombat"))
+    local cbBandage = MakeCheckBox("SnackBarCheckBandageSelf", g,
+        "Always bandage myself", 22, -196, function(on)
             if SnackBarDB then SnackBarDB.bandageSelf = on and true or nil end
         end)
+    local cbMinimap = MakeCheckBox("SnackBarCheckHideMinimap", g,
+        "Hide minimap icon", 22, -220, function(on)
+            if SnackBarDB then SnackBarDB.hideMinimap = on and true or nil end
+            UpdateMinimapButton()
+        end)
     -- Main button's flyout direction ----------------------------------
-    local refreshDirs = MakeDirButtons("SnackBarMainDir", f, 26, -200, 130,
+    local refreshDirs = MakeDirButtons("SnackBarMainDir", g, 26, -248, 130,
         function(key)
             if not SnackBarDB then return nil end
             if key == "arrow" then return SnackBarDB.autoArrow end
@@ -2346,8 +2916,8 @@ local function BuildOptions()
     -- Which food a mana class eats first (hidden for warriors and rogues) ----
     local EAT_ORDER = { false, "health", "mana" }
     local EAT_NAME = { health = "health food", mana = "mana food" }
-    local eatBtn = MakeSmallButton("SnackBarEatFirst", f, "", 200, 22)
-    eatBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -230)
+    local eatBtn = MakeSmallButton("SnackBarEatFirst", g, "", 200, 22)
+    eatBtn:SetPoint("TOPLEFT", g, "TOPLEFT", 26, -278)
     eatBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     local function RefreshEatFirst()
         local p = SnackBarDB and SnackBarDB.eatFirst
@@ -2368,32 +2938,186 @@ local function BuildOptions()
         GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
         GameTooltip:SetText("Eat first")
         GameTooltip:AddLine("Choose whether the main button offers health food or mana food first.", 1, 1, 1, 1)
-        GameTooltip:AddLine("While you are eating that kind, the button switches to the other kind so you can eat and drink at the same time.", 0.7, 0.7, 0.7, 1)
+        GameTooltip:AddLine("While you eat the first kind, the button offers the other kind so you can eat and drink at the same time.", 0.7, 0.7, 0.7, 1)
         GameTooltip:Show()
     end)
     eatBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     if not HasManaClass() then eatBtn:Hide() end
 
     -- Sliders ---------------------------------------------------------
-    local _, _, setScale = MakeSlider("SnackBarScaleSlider", f, "Button scale",
-        SCALE_MIN, SCALE_MAX, 0.05, "%.2f", -284,
+    local _, _, setScale = MakeSlider("SnackBarScaleSlider", g, "Button scale",
+        SCALE_MIN, SCALE_MAX, 0.05, "%.2f", -332,
         function(v) ApplyScaleAll(v) end)
 
-    local _, _, setLock = MakeSlider("SnackBarLockSlider", f, "Lock after eating (sec)",
-        LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -350,
+    local _, _, setLock = MakeSlider("SnackBarLockSlider", g, "Lock after eating (sec)",
+        LOCK_MIN, LOCK_MAX, 0.1, "%.1f", -398,
         function(v) if SnackBarDB then SnackBarDB.lock = v end end)
 
-    local lockHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    lockHint:SetPoint("TOPLEFT", f, "TOPLEFT", 26, -384)
+    local lockHint = g:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    lockHint:SetPoint("TOPLEFT", g, "TOPLEFT", 26, -432)
     lockHint:SetWidth(280)
     lockHint:SetJustifyH("LEFT")
-    lockHint:SetText("The main button ignores clicks this long after you eat, so food is not wasted. 0 = off. Custom buttons have their own lock.")
+    lockHint:SetText("After you eat, the main button ignores clicks for this long so you don't waste food. 0 = off. Each custom button has its own lock.")
 
-    local customBtn = MakeSmallButton("SnackBarOpenCustom", f, "Custom Buttons...", 170, 24)
-    customBtn:SetPoint("BOTTOM", f, "BOTTOM", 0, 20)
+    local resetBtn = MakeSmallButton("SnackBarResetPos", g, "Reset Positions", 140, 24)
+    resetBtn:SetPoint("BOTTOM", g, "BOTTOM", 75, 20)
+    resetBtn:SetScript("OnClick", function() ResetPositions() end)
+    resetBtn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Reset Positions")
+        GameTooltip:AddLine("Moves every button back to the center of the screen. Use it if a button gets lost off the edge.", 1, 1, 1, 1)
+        GameTooltip:Show()
+    end)
+    resetBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    local customBtn = MakeSmallButton("SnackBarOpenCustom", g, "Custom Buttons...", 140, 24)
+    customBtn:SetPoint("BOTTOM", g, "BOTTOM", -75, 20)
     customBtn:SetScript("OnClick", function()
         ToggleCustomWindow()
     end)
+
+    -- Item bar tabs --------------------------------------------------
+    local function BuildItemPage(key, tabLabel, blurb)
+        local pg = NewPage(-66)
+        pages[key] = pg
+        local base = "SnackBar" .. tabLabel .. "Opt"
+        local unit
+        for i = 1, table.getn(itemUnits) do
+            if itemUnits[i].kind == key then unit = itemUnits[i] end
+        end
+        local function C()
+            return SnackBarDB and SnackBarDB.itemBars and SnackBarDB.itemBars[key]
+        end
+        local function Changed()
+            ApplyCombatVisibility()
+            RefreshAll()
+        end
+        local function SetFlag(field)
+            return function(on)
+                local c = C()
+                if c then c[field] = on and true or false end
+                Changed()
+            end
+        end
+        local function SetNumber(field)
+            return function(v)
+                local c = C()
+                if c then c[field] = v end
+                Changed()
+            end
+        end
+
+        local text = pg:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        text:SetPoint("TOPLEFT", pg, "TOPLEFT", 26, -2)
+        text:SetWidth(280)
+        text:SetJustifyH("LEFT")
+        if key ~= "health" and not HasManaClass() then
+            text:SetText("|cffff6060Your class has no mana, so this bar is not used.|r")
+        else
+            text:SetText(blurb)
+        end
+
+        local cbShown = MakeCheckBox(base .. "Shown", pg, "Show this bar", 22, -46, SetFlag("shown"))
+        local cbFly = MakeCheckBox(base .. "Flyout", pg, "Show flyout arrow", 22, -70,
+            function(on)
+                local c = C()
+                if c then c.noFlyout = (not on) or nil end
+                Changed()
+            end)
+
+        local refreshDirs = MakeDirButtons(base .. "Dir", pg, 26, -100, 130,
+            function(k)
+                local c = C()
+                return c and c[k]
+            end,
+            function(k, dir)
+                local c = C()
+                if c then c[k] = dir end
+            end)
+
+        local keyLabel = pg:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        keyLabel:SetPoint("TOPLEFT", pg, "TOPLEFT", 26, -134)
+        keyLabel:SetText("Keybind:")
+        local keyBtn = MakeKeyCapture(base .. "Key", pg, function() return unit.action end)
+        keyBtn:SetPoint("LEFT", keyLabel, "RIGHT", 12, 0)
+        table.insert(pageStoppers, keyBtn.Stop)
+
+        -- Rules that depend on the bar
+        local cb1, cb2
+        if key == "health" then
+            cb1 = MakeCheckBox(base .. "PotOoc", pg, "Use potions out of combat", 22, -160, SetFlag("potionsOoc"))
+            cb2 = MakeCheckBox(base .. "BandCombat", pg, "Use bandages in combat", 22, -184, SetFlag("bandageCombat"))
+        elseif key == "mana" then
+            cb1 = MakeCheckBox(base .. "PotOoc", pg, "Use potions and runes out of combat", 22, -160, SetFlag("potionsOoc"))
+        else
+            cb1 = MakeCheckBox(base .. "PotOoc", pg, "Use potions out of combat", 22, -160, SetFlag("potionsOoc"))
+        end
+
+        local y = -216
+        local _, _, setMissOoc = MakeSlider(base .. "MissOoc", pg, "Use when missing, out of combat",
+            0, 5000, 50, "%.0f", y, SetNumber("missOoc"))
+        y = y - 46
+        local _, _, setMissCombat = MakeSlider(base .. "MissCombat", pg, "Use when missing, in combat",
+            0, 5000, 50, "%.0f", y, SetNumber("missCombat"))
+        y = y - 46
+        local _, _, setMinGain = MakeSlider(base .. "MinGain", pg, "Min. restored per use",
+            0, 5000, 50, "%.0f", y, SetNumber("minGain"))
+        y = y - 46
+        local _, _, setMaxWaste = MakeSlider(base .. "MaxWaste", pg, "Max. wasted per use (5000 = any)",
+            0, 5000, 50, "%.0f", y, SetNumber("maxWaste"))
+        y = y - 46
+        local setMinHealth
+        if key == "mana" then
+            local _, _, sf = MakeSlider(base .. "MinHealth", pg, "Health-cost items: keep health above",
+                0, 5000, 50, "%.0f", y, SetNumber("minHealth"))
+            setMinHealth = sf
+            y = y - 46
+        end
+        local _, _, setLock = MakeSlider(base .. "Lock", pg, "Lock after use (sec)",
+            LOCK_MIN, LOCK_MAX, 0.1, "%.1f", y,
+            function(v)
+                local c = C()
+                if c then c.lock = v end
+            end)
+
+        local hint = pg:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        hint:SetPoint("TOPLEFT", pg, "TOPLEFT", 26, y - 34)
+        hint:SetWidth(280)
+        hint:SetJustifyH("LEFT")
+        local htext = "Amounts are points of health or mana. How much an item restores comes from its tooltip, then from what your combat log shows it really restoring."
+        if key == "mana" then
+            htext = htext .. " Health-cost items (such as Demonic Runes) drain your health when used. They are skipped if using one would leave you with less health than the amount set above."
+        end
+        hint:SetText(htext)
+
+        pg:SetScript("OnShow", function()
+            local c = C() or {}
+            cbShown:SetChecked(c.shown ~= false and 1 or nil)
+            cbFly:SetChecked((not c.noFlyout) and 1 or nil)
+            refreshDirs()
+            if cb1 then
+                cb1:SetChecked(c.potionsOoc and 1 or nil)
+            end
+            if cb2 then
+                cb2:SetChecked(c.bandageCombat and 1 or nil)
+            end
+            setMissOoc(c.missOoc or 300)
+            setMissCombat(c.missCombat or 150)
+            setMinGain(c.minGain or 100)
+            setMaxWaste(c.maxWaste or 5000)
+            if setMinHealth then setMinHealth(c.minHealth or 800) end
+            setLock(c.lock or (SnackBarDB and SnackBarDB.lock) or DEFAULT_LOCK)
+            keyBtn.Refresh()
+        end)
+        pg:Hide()
+    end
+
+    BuildItemPage("health", "Health",
+        "Health potions, bandages and healthstones. Picks the item that best fits the health you're missing.")
+    BuildItemPage("mana", "Mana",
+        "Mana potions, mana gems and runes. Picks the item that best fits the mana you're missing.")
+    BuildItemPage("both", "Both",
+        "Items that restore both health and mana, such as rejuvenation potions.")
 
     f:SetScript("OnShow", function()
         local db = SnackBarDB or {}
@@ -2403,6 +3127,8 @@ local function BuildOptions()
         cbHideFly:SetChecked(db.hideFlyoutCombat and 1 or nil)
         cbHideFrame:SetChecked(db.hideFrameCombat and 1 or nil)
         cbBandage:SetChecked(db.bandageSelf and 1 or nil)
+        cbMinimap:SetChecked(db.hideMinimap and 1 or nil)
+        cbMain:SetChecked((not db.hideMain) and 1 or nil)
         refreshDirs()
         RefreshEatFirst()
         keyBtn.Refresh()
@@ -2410,9 +3136,11 @@ local function BuildOptions()
 
     f:SetScript("OnHide", function()
         keyBtn.Stop()
+        for i = 1, table.getn(pageStoppers) do pageStoppers[i]() end
     end)
 
     table.insert(UISpecialFrames, "SnackBarOptionsFrame")   -- Esc closes it
+    SelectTab("general")
     f:Hide()
     return f
 end
@@ -2424,6 +3152,83 @@ local function ToggleOptions()
     else
         optionsFrame:Show()
     end
+end
+
+----------------------------------------------------------------------
+-- Minimap icon: drag it anywhere on the screen. Left-click opens the
+-- options, right-click the custom buttons. Hide it in the options.
+----------------------------------------------------------------------
+
+local mmButton = CreateFrame("Button", "SnackBarMinimapButton", UIParent)
+mmButton:SetWidth(32)
+mmButton:SetHeight(32)
+mmButton:SetFrameStrata("MEDIUM")
+mmButton:SetFrameLevel(8)
+mmButton:SetMovable(true)
+mmButton:SetClampedToScreen(true)
+mmButton:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+mmButton:RegisterForDrag("LeftButton")
+mmButton:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
+
+local mmIcon = mmButton:CreateTexture(nil, "BACKGROUND")
+mmIcon:SetTexture("Interface\\Icons\\INV_Potion_73")      -- Greater Mana Potion
+mmIcon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+mmIcon:SetWidth(20)
+mmIcon:SetHeight(20)
+mmIcon:SetPoint("TOPLEFT", mmButton, "TOPLEFT", 6, -5)
+
+local mmBorder = mmButton:CreateTexture(nil, "OVERLAY")
+mmBorder:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+mmBorder:SetWidth(54)
+mmBorder:SetHeight(54)
+mmBorder:SetPoint("TOPLEFT", mmButton, "TOPLEFT", 0, 0)
+
+mmButton:SetScript("OnDragStart", function()
+    this:StartMoving()
+end)
+mmButton:SetScript("OnDragStop", function()
+    this:StopMovingOrSizing()
+    local l, b = this:GetLeft(), this:GetBottom()
+    if l and b and SnackBarDB then
+        SnackBarDB.mmX = l
+        SnackBarDB.mmY = b
+    end
+end)
+mmButton:SetScript("OnClick", function()
+    if arg1 == "RightButton" then
+        ToggleCustomWindow()
+    else
+        ToggleOptions()
+    end
+end)
+mmButton:SetScript("OnEnter", function()
+    GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+    GameTooltip:SetText("SnackBar")
+    GameTooltip:AddLine("Left-click: options", 1, 1, 1)
+    GameTooltip:AddLine("Right-click: custom buttons", 1, 1, 1)
+    GameTooltip:AddLine("Drag: move this icon anywhere", 0.7, 0.7, 0.7)
+    GameTooltip:Show()
+end)
+mmButton:SetScript("OnLeave", function()
+    GameTooltip:Hide()
+end)
+
+function UpdateMinimapButton()
+    if SnackBarDB and SnackBarDB.hideMinimap then
+        mmButton:Hide()
+    else
+        mmButton:Show()
+    end
+end
+
+function PlaceMinimapButton()
+    mmButton:ClearAllPoints()
+    if SnackBarDB and SnackBarDB.mmX and SnackBarDB.mmY then
+        mmButton:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", SnackBarDB.mmX, SnackBarDB.mmY)
+    else
+        mmButton:SetPoint("CENTER", Minimap, "BOTTOMLEFT", 14, 14)
+    end
+    UpdateMinimapButton()
 end
 
 ----------------------------------------------------------------------
@@ -2527,6 +3332,8 @@ driver:RegisterEvent("UNIT_MAXHEALTH")
 driver:RegisterEvent("UNIT_MAXMANA")
 driver:RegisterEvent("PLAYER_LEVEL_UP")
 driver:RegisterEvent("PLAYER_AURAS_CHANGED")
+driver:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
+driver:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_SELF_BUFFS")
 
 driver:SetScript("OnEvent", function()
     if event == "VARIABLES_LOADED" then
@@ -2543,11 +3350,24 @@ driver:SetScript("OnEvent", function()
             SnackBarCharDB.buttons = SnackBarDB.buttons or {}
             SnackBarDB.buttons = nil
         end
+        if not SnackBarDB.itemBars then SnackBarDB.itemBars = {} end
+        for key, def in pairs(ITEM_BAR_DEFAULTS) do
+            local c = SnackBarDB.itemBars[key]
+            if not c then
+                c = {}
+                SnackBarDB.itemBars[key] = c
+            end
+            for k, v in pairs(def) do
+                if c[k] == nil then c[k] = v end
+            end
+        end
         for i = 1, table.getn(allUnits) do
             allUnits[i].btn:SetScale(SnackBarDB.scale)
         end
         ApplyPosition(mainUnit)
         BindCustomUnits()
+        BindItemBars()
+        PlaceMinimapButton()
         dirty = true
     elseif event == "PLAYER_ENTERING_WORLD" then
         combatFlag = UnitAffectingCombat("player") and true or false
@@ -2557,6 +3377,8 @@ driver:SetScript("OnEvent", function()
             loginChecked = true
             loginCheckAt = GetTime() + 5     -- one-time recheck a few seconds after login
         end
+    elseif event == "CHAT_MSG_SPELL_SELF_BUFF" or event == "CHAT_MSG_SPELL_PERIODIC_SELF_BUFFS" then
+        ReadRestoreMessage(arg1)
     elseif event == "PLAYER_AURAS_CHANGED" then
         buffCache = nil
         debuffCache = nil
@@ -2601,24 +3423,21 @@ SlashCmdList["SNACKBAR"] = function(msg)
     elseif msg == "rescan" then
         ForceRescan()
         Say("Bags rescanned.")
-    elseif msg == "reset" then
+    elseif msg == "minimap" then
         if SnackBarDB then
-            SnackBarDB.x = nil
-            SnackBarDB.y = nil
-            local bars = (SnackBarCharDB and SnackBarCharDB.buttons) or {}
-            for i = 1, table.getn(bars) do
-                bars[i].x = nil
-                bars[i].y = nil
-            end
+            SnackBarDB.hideMinimap = (not SnackBarDB.hideMinimap) or nil
+            UpdateMinimapButton()
+            Say("Minimap icon " .. (SnackBarDB.hideMinimap and "hidden." or "shown."))
         end
-        for i = 1, table.getn(allUnits) do ApplyPosition(allUnits[i]) end
-        Say("Positions reset.")
+    elseif msg == "reset" then
+        ResetPositions()
     else
         Say("/sb - open options")
         Say("/sb custom - edit custom buttons")
         Say("/sb eat - eat the best food now")
         Say("/sb rescan - recheck your bags")
-        Say("/sb reset - reset button positions")
+        Say("/sb reset - move all buttons back to the center of the screen")
+        Say("/sb minimap - show or hide the minimap icon")
         Say("Shift+drag a button to move it.")
     end
 end

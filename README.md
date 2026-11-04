@@ -18,6 +18,10 @@ Copy this folder into `Interface/AddOns/` and make sure it is named `SnackBar`.
 - Clock-style cooldown sweep on the button (item cooldown or lock); equipped on-use trinkets can be listed on custom bars.
 - "Always bandage myself" option; with it on, Recently Bandaged shows as the bandage's cooldown.
 - Per-bar flyout arrow toggle.
+- Three automatic item bars (Health, Mana, Health+Mana) that pick the best potion, bandage, healthstone, mana gem or rune for what you are missing. Never food. Each has its own options tab.
+- Item bar rules in absolute amounts: how much must be missing (out of combat and in combat), minimum restored, maximum wasted, and a health floor for health-costing items. Restore amounts come from the tooltip and are corrected by what your combat log shows items restoring.
+- Option to hide any bar, including the main button; draggable minimap icon (can be hidden).
+- Keybind capture supports modifiers and mouse buttons; Reset Positions button as a failsafe.
 - Greyed while in combat, locked, on cooldown or dead; respects the global cooldown.
 
 ## Commands

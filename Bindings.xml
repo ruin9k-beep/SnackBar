@@ -2,6 +2,15 @@
     <Binding name="SNACKBAR_EAT" header="SNACKBAR">
         SnackBar_Eat()
     </Binding>
+    <Binding name="SNACKBAR_HEALTH">
+        SnackBar_UseItemBar(1)
+    </Binding>
+    <Binding name="SNACKBAR_MANA">
+        SnackBar_UseItemBar(2)
+    </Binding>
+    <Binding name="SNACKBAR_BOTH">
+        SnackBar_UseItemBar(3)
+    </Binding>
     <Binding name="SNACKBAR_CUSTOM1">
         SnackBar_UseCustom(1)
     </Binding>

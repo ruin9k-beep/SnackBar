@@ -1,8 +1,8 @@
 ## Interface: 11200
 ## Title: SnackBar
-## Notes: One button that eats the best food/drink in your bags. Conjured first, no stat-buff food. /sb for options.
+## Notes: One button eats the best food/drink; three more pick the best health, mana and health+mana items. /sb for options.
 ## Author: ruin9k
-## Version: 1.4
+## Version: 1.5
 ## SavedVariables: SnackBarDB
 ## SavedVariablesPerCharacter: SnackBarCharDB
 
