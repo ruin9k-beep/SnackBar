@@ -658,7 +658,7 @@ end
 -- cost health are skipped if they would leave you below this much.
 local ITEM_BAR_DEFAULTS = {
     health = { name = "Health items", shown = true, missOoc = 300, missCombat = 150,
-               minGain = 100, maxWaste = 5000, potionsOoc = false, bandageCombat = false },
+               minGain = 100, maxWaste = 5000, potionsOoc = false, bandageCombat = false, bandageFirstOoc = false },
     mana = { name = "Mana items", shown = true, missOoc = 300, missCombat = 150,
              minGain = 100, maxWaste = 5000, potionsOoc = false, minHealth = 800 },
     both = { name = "Health + mana items", shown = true, missOoc = 300, missCombat = 150,
@@ -878,6 +878,7 @@ end
 -- a is a better pick than b: more useful wins; when about equal, the cheaper
 -- kind of item wins; then the smaller one, so big items aren't wasted.
 local function Fits(a, b)
+    if a.first ~= b.first then return a.first > b.first end   -- bandages if preferred, then conjured items in combat
     local tol = 0.1 * math.max(a.useful, b.useful)
     if math.abs(a.useful - b.useful) > tol then return a.useful > b.useful end
     if a.tier ~= b.tier then return a.tier < b.tier end
@@ -941,6 +942,12 @@ local function ScanItemBar(u, inv)
             end
             c.dmg = info.dmgMax
             c.bandage = info.bandage
+            c.first = 0
+            if c.bandage and ((combat and cfg.bandageCombat) or (not combat and cfg.bandageFirstOoc)) then
+                c.first = 2
+            elseif combat and info.conjured then
+                c.first = 1
+            end
             if info.conjured then c.tier = 0
             elseif c.dmg > 0 then c.tier = 3
             elseif c.bandage then c.tier = 1
@@ -3043,17 +3050,18 @@ local function BuildOptions()
         table.insert(pageStoppers, keyBtn.Stop)
 
         -- Rules that depend on the bar
-        local cb1, cb2
+        local cb1, cb2, cb3
         if key == "health" then
             cb1 = MakeCheckBox(base .. "PotOoc", pg, "Use potions out of combat", 22, -160, SetFlag("potionsOoc"))
             cb2 = MakeCheckBox(base .. "BandCombat", pg, "Use bandages in combat", 22, -184, SetFlag("bandageCombat"))
+            cb3 = MakeCheckBox(base .. "BandFirst", pg, "Prefer bandages out of combat", 22, -208, SetFlag("bandageFirstOoc"))
         elseif key == "mana" then
             cb1 = MakeCheckBox(base .. "PotOoc", pg, "Use potions and runes out of combat", 22, -160, SetFlag("potionsOoc"))
         else
             cb1 = MakeCheckBox(base .. "PotOoc", pg, "Use potions out of combat", 22, -160, SetFlag("potionsOoc"))
         end
 
-        local y = -216
+        local y = (key == "health") and -240 or -216
         local _, _, setMissOoc = MakeSlider(base .. "MissOoc", pg, "Use when missing, out of combat",
             0, 5000, 50, "%.0f", y, SetNumber("missOoc"))
         y = y - 46
@@ -3101,6 +3109,7 @@ local function BuildOptions()
             if cb2 then
                 cb2:SetChecked(c.bandageCombat and 1 or nil)
             end
+            if cb3 then cb3:SetChecked(c.bandageFirstOoc and 1 or nil) end
             setMissOoc(c.missOoc or 300)
             setMissCombat(c.missCombat or 150)
             setMinGain(c.minGain or 100)
