@@ -660,7 +660,7 @@ local ITEM_BAR_DEFAULTS = {
     health = { name = "Health items", shown = true, missOoc = 300, missCombat = 150,
                minGain = 100, maxWaste = 5000, potionsOoc = false, bandageCombat = false, bandageFirstOoc = false },
     mana = { name = "Mana items", shown = true, missOoc = 300, missCombat = 150,
-             minGain = 100, maxWaste = 5000, potionsOoc = false, minHealth = 800 },
+             minGain = 100, maxWaste = 5000, potionsOoc = false, minHealth = 800, costLast = false },
     both = { name = "Health + mana items", shown = true, missOoc = 300, missCombat = 150,
              minGain = 100, maxWaste = 5000, potionsOoc = false },
 }
@@ -921,6 +921,7 @@ local function ScanItemBar(u, inv)
         if paid and not combat and not cfg.potionsOoc then ok = false end
         if c.bandage and combat and not cfg.bandageCombat then ok = false end
         if c.dmg > 0 and hp - c.dmg < minHp then ok = false end
+        if c.dmg > 0 and cfg.costLast and not combat then ok = false end
         c.ok = ok
     end
 
@@ -948,6 +949,7 @@ local function ScanItemBar(u, inv)
             elseif combat and info.conjured then
                 c.first = 1
             end
+            if c.dmg > 0 and cfg.costLast then c.first = -1 end   -- health-cost items rank last
             if info.conjured then c.tier = 0
             elseif c.dmg > 0 then c.tier = 3
             elseif c.bandage then c.tier = 1
@@ -3057,6 +3059,7 @@ local function BuildOptions()
             cb3 = MakeCheckBox(base .. "BandFirst", pg, "Prefer bandages out of combat", 22, -208, SetFlag("bandageFirstOoc"))
         elseif key == "mana" then
             cb1 = MakeCheckBox(base .. "PotOoc", pg, "Use potions and runes out of combat", 22, -160, SetFlag("potionsOoc"))
+            cb2 = MakeCheckBox(base .. "CostLast", pg, "Health-cost items: last, combat only", 22, -184, SetFlag("costLast"))
         else
             cb1 = MakeCheckBox(base .. "PotOoc", pg, "Use potions out of combat", 22, -160, SetFlag("potionsOoc"))
         end
@@ -3107,7 +3110,8 @@ local function BuildOptions()
                 cb1:SetChecked(c.potionsOoc and 1 or nil)
             end
             if cb2 then
-                cb2:SetChecked(c.bandageCombat and 1 or nil)
+                if key == "mana" then cb2:SetChecked(c.costLast and 1 or nil)
+                else cb2:SetChecked(c.bandageCombat and 1 or nil) end
             end
             if cb3 then cb3:SetChecked(c.bandageFirstOoc and 1 or nil) end
             setMissOoc(c.missOoc or 300)
